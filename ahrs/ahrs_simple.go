@@ -20,22 +20,19 @@ const (
 	gyroCalDuration = 200  // Number of samples to collect (2 seconds at 100Hz)
 )
 
-
 type State struct {
-	T float64 // Time when state last updated
-	F0, F1, F2, F3 float64 // quaternion rotating aircraft frame to sensor frame
-	f11, f12, f13 float64 // cached sensor-aircraft rotation matrix
-	f21, f22, f23 float64
-	f31, f32, f33 float64
+		T float64 // Time when state last updated
 }
 
 type SimpleState struct {
 	State
+	T float64 // Time when state last updated
 	tW                            float64                // Time of last GPS reading
 	roll, pitch, heading          float64                // Fused attitude, Rad
 	slipSkid                      float64                // Slip/Skid Angle, Rad
 	gLoad                         float64                // G Load, G vertical
 	turnRate                      float64                // turn rate, Rad/s
+	dcm						  [3][3]float64
 	needsInitialization           bool                   // Rather than computing, initialize
 	logMap                        map[string]interface{} // Map only for analysis/debugging
 	// Add gyro bias fields
@@ -59,6 +56,22 @@ type Measurement struct { // Order here also defines order in the matrices below
 	//TODO westphae: track separate measurement timestamps for Gyro/Accel, Magnetometer, GPS, Baro
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+/////////////////////////////////////////////////////////////////////////
+// Constructor functions
+/////////////////////////////////////////////////////////////////////////
+
 //NewSimpleAHRS returns a new Simple AHRS object.
 // It is initialized with a beginning sensor orientation quaternion f0.
 func NewAHRS() (s *SimpleState) {
@@ -68,10 +81,11 @@ func NewAHRS() (s *SimpleState) {
 	s.needsInitialization = true
 	s.needsGyroCal = true
 
-	// Initialize magnetometer calibration with your values M2, M1, M3 (mx, my, mz)
-    s.magOffset = [3]float64{3140.8, 1824.9, -1533.5}
-    s.magScale = [3]float64{.974484, 1.000000, 0.605036}
+	// Initialize magnetometer calibration with your values M2, M1, -M3 (mx, my, mz)
+    s.magOffset = [3]float64{5154, 589, 1209}
+    s.magScale = [3]float64{0.000158780565259, 0.000160901045857, 0.000143802128271}
     s.magCalibrated = true
+
 
 	return
 }
@@ -96,6 +110,11 @@ func NewMeasurement() *Measurement {
 
 
 
+/////////////////////////////////////////////////////////////////////////
+// Initialization
+/////////////////////////////////////////////////////////////////////////
+
+
 
 func (s *SimpleState) init(m *Measurement) {
 	log.Printf("Initializing")
@@ -109,7 +128,7 @@ func (s *SimpleState) init(m *Measurement) {
 	az:=m.A3
 	mx:=m.M2
 	my:=m.M1
-	mz:=m.M3
+	mz:=-m.M3
 
 	s.roll = math.Atan2(ay, az)
 	s.pitch = math.Atan2(-ax, math.Sqrt(ay*ay + az*az))
@@ -126,8 +145,6 @@ func (s *SimpleState) init(m *Measurement) {
 
 	log.Printf("INIT: roll %f pitch %f yaw %f", s.roll*R2D, s.pitch*R2D, s.heading*R2D)
 	
-	s.F0, s.F1, s.F2, s.F3 = toQuaternion(s.roll, s.pitch, s.heading)
-	s.calcRotationMatrices()
 
 	//these were fixed to use body-fixed accelerations instead of inertial accelerations
 	// Initialize Slip/Skid, Rate of Turn, and GLoad.
@@ -183,6 +200,14 @@ func (s *SimpleState) calibrateGyro(m *Measurement) bool {
 }
 
 
+// ResetGyroCal triggers a new gyro calibration
+func (s *SimpleState) ResetGyroCal() {
+	s.needsGyroCal = true
+	s.gyroCalSamples = 0
+	s.gyroCalSum = [3]float64{0, 0, 0}
+	s.gyroBias = [3]float64{0, 0, 0}
+	log.Printf("AHRS: Gyro calibration reset - keep IMU stationary!")
+}
 
 
 
@@ -215,7 +240,9 @@ func (s *SimpleState) calibrateGyro(m *Measurement) bool {
 
 
 
-
+/////////////////////////////////////////////////////////////////////////
+// Run
+/////////////////////////////////////////////////////////////////////////
 
 
 
@@ -308,7 +335,7 @@ func (s *SimpleState) Update(m *Measurement) {
 	az := m.A3 // Accel Z (g)
 	mx := m.M2 // Mag X 
 	my := m.M1 // Mag Y 
-	mz := m.M3 // Mag Z 
+	mz := -m.M3 // Mag Z 
 
 
 	// Apply magnetometer calibration if enabled
@@ -318,22 +345,30 @@ func (s *SimpleState) Update(m *Measurement) {
         mz = (mz - s.magOffset[2]) * s.magScale[2]
     }
 	
+	mmag := math.Sqrt(mx*mx+my*my+mz*mz)
+
+	//check if magnetometer data is invalid  (this works good!  Keeps outputs within calibration values)
+	if mmag < 0.9 || mmag > 1.1 {
+		mx, my, mz = 0, 0, 0
+	}
+
+	
 	
 	s.roll = math.Atan2(ay, az)
 	s.pitch = math.Atan2(-ax, math.Sqrt(ay*ay + az*az))
 
-    m1 := mx * math.Cos(s.pitch) + my * math.Sin(s.roll);           
-    m2 := mx * math.Sin(s.roll) * math.Sin(s.pitch) + my * math.Cos(s.roll) - mz * math.Sin(s.roll) * math.Cos(s.pitch);
-    s.heading = math.Atan2(m2, m1);
-	for s.heading < 0 {
-		s.heading += 2 * Pi
+	if mx!=0 && my!=0 && mz!=0 {
+		//transform from body to inertial coordinates, pitch and roll only
+		m1 := mx * math.Cos(s.pitch) + my * math.Sin(s.roll) * math.Sin(s.pitch) + mz * math.Cos(s.roll) * math.Sin(s.pitch);           
+		m2 := my * math.Cos(s.roll) - mz * math.Sin(s.roll);
+		s.heading = math.Atan2(m2, m1);
+		for s.heading < 0 {
+			s.heading += 2 * Pi
+		}
+		for s.heading >= 2*Pi {
+			s.heading -= 2 * Pi
+		}
 	}
-	for s.heading >= 2*Pi {
-		s.heading -= 2 * Pi
-	}
-	
-	s.F0, s.F1, s.F2, s.F3 = toQuaternion(s.roll, s.pitch, s.heading)
-	s.calcRotationMatrices()
 
 	//these were fixed to use body-fixed accelerations instead of inertial accelerations
 	// Initialize Slip/Skid, Rate of Turn, and GLoad.
@@ -359,16 +394,29 @@ func (s *SimpleState) Update(m *Measurement) {
 
 
 
-
-
-// ResetGyroCal triggers a new gyro calibration
-func (s *SimpleState) ResetGyroCal() {
-	s.needsGyroCal = true
-	s.gyroCalSamples = 0
-	s.gyroCalSum = [3]float64{0, 0, 0}
-	s.gyroBias = [3]float64{0, 0, 0}
-	log.Printf("AHRS: Gyro calibration reset - keep IMU stationary!")
+// eulerToDCM calculates the Direction Cosine Matrix from Euler angles
+// phi = roll, theta = pitch, psi = yaw (all in radians)
+// Returns a 3x3 DCM that rotates from body frame to earth frame
+func eulerToDCM(phi, theta, psi float64) [3][3]float64 {
+    // Precompute trig functions
+    cphi := math.Cos(phi)
+    sphi := math.Sin(phi)
+    ctheta := math.Cos(theta)
+    stheta := math.Sin(theta)
+    cpsi := math.Cos(psi)
+    spsi := math.Sin(psi)
+    
+    // Standard aerospace DCM (Z-Y-X rotation sequence)
+    // This is the most common convention for aircraft
+    dcm := [3][3]float64{
+        {ctheta * cpsi, ctheta * spsi, -stheta},
+        {sphi * stheta * cpsi - cphi * spsi, sphi * stheta * spsi + cphi * cpsi, sphi * ctheta},
+        {cphi * stheta * cpsi + sphi * spsi, cphi * stheta * spsi - sphi * cpsi, cphi * ctheta},
+    }
+    
+    return dcm
 }
+
 
 
 
@@ -527,95 +575,8 @@ var SimpleJSONConfig = `{
 }`
 
 
-// calcRotationMatrices populates the rotation matrices in the State based on
-// the quaternions E and F
-func (s *State) calcRotationMatrices() {
-	// fij rotates sensor frame j component into aircraft frame i component
-	// X_s = F*X_a*conj(F)
-	s.f11 = (+s.F0*s.F0 + s.F1*s.F1 - s.F2*s.F2 - s.F3*s.F3)
-	s.f12 = 2 * (-s.F0*s.F3 + s.F1*s.F2)
-	s.f13 = 2 * (+s.F0*s.F2 + s.F3*s.F1)
-	s.f21 = 2 * (+s.F0*s.F3 + s.F1*s.F2)
-	s.f22 = (+s.F0*s.F0 - s.F1*s.F1 + s.F2*s.F2 - s.F3*s.F3)
-	s.f23 = 2 * (-s.F0*s.F1 + s.F2*s.F3)
-	s.f31 = 2 * (-s.F0*s.F2 + s.F3*s.F1)
-	s.f32 = 2 * (+s.F0*s.F1 + s.F2*s.F3)
-	s.f33 = (+s.F0*s.F0 - s.F1*s.F1 - s.F2*s.F2 + s.F3*s.F3)
-}
 
 
-// toQuaternion calculates the 0,1,2,3 components of the rotation quaternion
-// corresponding to the Tait-Bryan angles phi, theta, psi
-func toQuaternion(phi, theta, psi float64) (float64, float64, float64, float64) {
-	theta = -theta        // We want positive theta to mean pitch up
-	psi = math.Pi/2 - psi // We want psi to go N-E-S-W
-	cphi := math.Cos(phi / 2)
-	sphi := math.Sin(phi / 2)
-	ctheta := math.Cos(theta / 2)
-	stheta := math.Sin(theta / 2)
-	cpsi := math.Cos(psi / 2)
-	spsi := math.Sin(psi / 2)
-
-	q0 := cphi*ctheta*cpsi + sphi*stheta*spsi
-	q1 := sphi*ctheta*cpsi - cphi*stheta*spsi
-	q2 := cphi*stheta*cpsi + sphi*ctheta*spsi
-	q3 := cphi*ctheta*spsi - sphi*stheta*cpsi
-	return q0, q1, q2, q3
-}
-
-// fromQuaternion calculates the Tait-Bryan angles phi, theta, psi corresponding to
-// the quaternion
-func fromQuaternion(q0, q1, q2, q3 float64) (phi float64, theta float64, psi float64) {
-	phi = math.Atan2(2*(q0*q1+q2*q3), (q0*q0 - q1*q1 - q2*q2 + q3*q3))
-
-	v := -2 * (q0*q2 - q3*q1) / (q0*q0 + q1*q1 + q2*q2 + q3*q3)
-	if v >= 1 {
-		theta = Pi / 2
-	} else if v <= -1 {
-		theta = -Pi / 2
-	} else {
-		theta = math.Asin(v)
-	}
-	psi = math.Pi/2 - math.Atan2(2*(q0*q3+q1*q2), (q0*q0+q1*q1-q2*q2-q3*q3))
-	if psi < 0 {
-		psi += 2 * math.Pi
-	}
-	return
-}
-
-// rotationMatrixToQuaternion computes the quaternion q corresponding to a rotation matrix r.
-func rotationMatrixToQuaternion(r [3][3]float64) (q0, q1, q2, q3 float64) {
-	q0 = math.Sqrt(1 + r[0][0] + r[1][1] + r[2][2])/2
-	q1 = (r[2][1] - r[1][2])/(4*q0)
-	q2 = (r[0][2] - r[2][0])/(4*q0)
-	q3 = (r[1][0] - r[0][1])/(4*q0)
-	return
-}
-
-// quaternionToRotationMatrix computes the rotation matrix r corresponding to a quaternion q.
-func quaternionToRotationMatrix(q0, q1, q2, q3 float64) (r *[3][3]float64) {
-	r = new([3][3]float64)
-	r[0][0] = +q0*q0 + q1*q1 - q2*q2 - q3*q3
-	r[0][1] = 2 * (-q0*q3 + q1*q2)
-	r[0][2] = 2 * (+q0*q2 + q1*q3)
-	r[1][0] = 2 * (+q0*q3 + q2*q1)
-	r[1][1] = +q0*q0 - q1*q1 + q2*q2 - q3*q3
-	r[1][2] = 2 * (-q0*q1 + q2*q3)
-	r[2][0] = 2 * (-q0*q2 + q3*q1)
-	r[2][1] = 2 * (+q0*q1 + q3*q2)
-	r[2][2] = +q0*q0 - q1*q1 - q2*q2 + q3*q3
-	return
-}
-
-// quaternionNormalize re-scales the input quaternion to unit norm.
-func quaternionNormalize(q0, q1, q2, q3 float64) (r0, r1, r2, r3 float64) {
-	qq := math.Sqrt(q0*q0 + q1*q1 + q2*q2 + q3*q3)
-	r0 = q0 / qq
-	r1 = q1 / qq
-	r2 = q2 / qq
-	r3 = q3 / qq
-	return
-}
 
 
 
@@ -710,7 +671,7 @@ func (s *SimpleState) Reset() {
 
 // RollPitchHeading returns the current attitude values as estimated by the Kalman algorithm.
 func (s *SimpleState) RollPitchHeading() (roll float64, pitch float64, heading float64) {
-	roll, pitch, heading = fromQuaternion(s.F0, s.F1, s.F2, s.F3)
+	roll, pitch, heading = s.roll, -s.pitch, s.heading
 	return
 }
 
@@ -766,7 +727,7 @@ type AHRSProvider interface {
 	// GLoad returns the current G load, in G's as estimated by the Kalman algorithm.
 	GLoad() (gLoad float64)
 	// GetState returns all the information about the current state.
-	GetState() *State
+	GetState() 
 	// GetLogMap returns a map customized for each AHRSProvider algorithm to provide more detailed information
 	// for debugging and logging.
 	GetLogMap() map[string]interface{}
