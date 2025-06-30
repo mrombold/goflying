@@ -17,11 +17,9 @@ const (
 	R2D     = 180 / Pi
 	D2R		= Pi / 180
 	Invalid float64  = 9999999 // 2**15-1
+	gyroCalDuration = 200  // Number of samples to collect (2 seconds at 100Hz)
 )
 
-//var (
-
-//)
 
 type State struct {
 	T float64 // Time when state last updated
@@ -40,6 +38,15 @@ type SimpleState struct {
 	turnRate                      float64                // turn rate, Rad/s
 	needsInitialization           bool                   // Rather than computing, initialize
 	logMap                        map[string]interface{} // Map only for analysis/debugging
+	// Add gyro bias fields
+	gyroBias                      [3]float64             // Gyro bias in deg/s (B1, B2, B3)
+	needsGyroCal                  bool                   // Flag to trigger gyro calibration
+	gyroCalSamples               int                    // Number of calibration samples collected
+	gyroCalSum                   [3]float64             // Sum of gyro readings during calibration
+	// Add magnetometer calibration
+    magOffset                     [3]float64  // Hard iron offsets
+    magScale                      [3]float64  // Soft iron scale factors
+    magCalibrated                 bool        // Whether mag calibration is applied
 }
 
 
@@ -47,7 +54,7 @@ type Measurement struct { // Order here also defines order in the matrices below
 	UValid, WValid, SValid, MValid bool // Do we have valid airspeed, GPS, accel/gyro, and magnetometer readings?
 	A1, A2, A3 float64 // Vector holding accelerometer readings, G, aircraft (accelerated) frame
 	B1, B2, B3 float64 // Vector of gyro rates in roll, pitch, heading axes, °/s, aircraft (accelerated) frame
-	M1, M2, M3 float64 // Vector of magnetometer readings, µT, aircraft (accelerated) frame
+	M1, M2, M3 float64 // Vector of magnetometer readings, µT, aircraft (accelerated) frame y, x, and z axes
 	TW, TU, T  float64 // Timestamp of GPS, airspeed and sensor readings
 	//TODO westphae: track separate measurement timestamps for Gyro/Accel, Magnetometer, GPS, Baro
 }
@@ -59,6 +66,13 @@ func NewAHRS() (s *SimpleState) {
 	s.logMap = make(map[string]interface{})
 	updateLogMap(s, NewMeasurement(), s.logMap)
 	s.needsInitialization = true
+	s.needsGyroCal = true
+
+	// Initialize magnetometer calibration with your values M2, M1, M3 (mx, my, mz)
+    s.magOffset = [3]float64{3140.8, 1824.9, -1533.5}
+    s.magScale = [3]float64{.974484, 1.000000, 0.605036}
+    s.magCalibrated = true
+
 	return
 }
 
@@ -90,15 +104,18 @@ func (s *SimpleState) init(m *Measurement) {
 	s.T = m.T
 	s.tW = m.TW
 
-	ax:=-m.A1
-	ay:=-m.A2
-	az:=-m.A3
+	ax:=m.A1
+	ay:=m.A2
+	az:=m.A3
+	mx:=m.M2
+	my:=m.M1
+	mz:=m.M3
 
-	s.roll = math.Atan2(ay, -az)
+	s.roll = math.Atan2(ay, az)
 	s.pitch = math.Atan2(-ax, math.Sqrt(ay*ay + az*az))
 
-    m1 := m.M1 * math.Cos(s.pitch) + m.M2 * math.Sin(s.roll);           
-    m2 := m.M1 * math.Sin(s.roll) * math.Sin(s.pitch) + m.M2 * math.Cos(s.roll) - m.M3 * math.Sin(s.roll) * math.Cos(s.pitch);
+    m1 := mx * math.Cos(s.pitch) + my * math.Sin(s.roll);           
+    m2 := mx * math.Sin(s.roll) * math.Sin(s.pitch) + my * math.Cos(s.roll) - mz * math.Sin(s.roll) * math.Cos(s.pitch);
     s.heading = math.Atan2(m2, m1);
 	for s.heading < 0 {
 		s.heading += 2 * Pi
@@ -123,7 +140,47 @@ func (s *SimpleState) init(m *Measurement) {
 }
 
 
-
+// calibrateGyro collects stationary gyro readings to estimate bias
+func (s *SimpleState) calibrateGyro(m *Measurement) bool {
+	if !s.needsGyroCal {
+		return true  // Calibration already complete
+	}
+	
+	// Check if gyro data is valid
+	if !m.SValid {
+		log.Printf("AHRS: Gyro calibration waiting for valid sensor data...")
+		return false
+	}
+	
+	// Accumulate gyro readings
+	s.gyroCalSum[0] += m.B1
+	s.gyroCalSum[1] += m.B2  
+	s.gyroCalSum[2] += m.B3
+	s.gyroCalSamples++
+	
+	// Log progress every 50 samples
+	if s.gyroCalSamples%50 == 0 {
+		log.Printf("AHRS: Gyro calibration progress: %d/%d samples", s.gyroCalSamples, gyroCalDuration)
+	}
+	
+	// Check if we have enough samples
+	if s.gyroCalSamples >= gyroCalDuration {
+		// Calculate average bias
+		s.gyroBias[0] = s.gyroCalSum[0] / float64(s.gyroCalSamples)
+		s.gyroBias[1] = s.gyroCalSum[1] / float64(s.gyroCalSamples)
+		s.gyroBias[2] = s.gyroCalSum[2] / float64(s.gyroCalSamples)
+		
+		s.needsGyroCal = false  // Mark calibration complete
+		
+		log.Printf("AHRS: Gyro calibration complete!")
+		log.Printf("AHRS: Gyro biases: X=%.3f Y=%.3f Z=%.3f deg/s", 
+			s.gyroBias[0], s.gyroBias[1], s.gyroBias[2])
+		
+		return true
+	}
+	
+	return false  // Still calibrating
+}
 
 
 
@@ -164,6 +221,15 @@ func (s *SimpleState) init(m *Measurement) {
 
 
 func (s *SimpleState) Compute(m *Measurement) {
+
+	// First check if we need to calibrate gyro
+	if s.needsGyroCal {
+		gyroCalComplete := s.calibrateGyro(m)
+		if !gyroCalComplete {
+			return  // Don't run AHRS until gyro calibration is done
+		}
+	}
+
 	if s.needsInitialization {
 		s.init(m)
 		log.Printf("INITIALIZATION BITCHESSSSSS!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -224,21 +290,6 @@ func (s *SimpleState) Predict(t float64) {
 func (s *SimpleState) Update(m *Measurement) {
 
 
-	kp :=    0.5
-	ki :=    0.01
-	kpMag := 0.5
-	//kiMag := 0.3
-
-	// Reset corrections
-	omegaP := [3]float64{0, 0, 0}
-	omegaI := omegaP
-
-	dcm := [3][3]float64{
-		{s.f11, s.f12, s.f13},
-		{s.f21, s.f22, s.f23},
-		{s.f31, s.f32, s.f33},
-	}
-
 	dt := m.T - s.T      //sensor delta-T
 	dtw := m.TW - s.tW   //gps delta-T
 
@@ -249,115 +300,47 @@ func (s *SimpleState) Update(m *Measurement) {
 	
 	// Extract sensor data (assuming Measurement has these fields)
 	// You'll need to adjust these field names to match the actual Measurement struct
-	gx := m.B1 * D2R // Gyro X (rad/s)
-	gy := m.B2 * D2R // Gyro Y (rad/s) 
-	gz := m.B3 * D2R // Gyro Z (rad/s)
-	ax := -m.A1 // Accel X (g)
-	ay := -m.A2 // Accel Y (g)
-	az := -m.A3 // Accel Z (g)
-	mx := m.M1 // Mag X 
-	my := m.M2 // Mag Y 
+	gx := (m.B1 - s.gyroBias[0]) * D2R // Gyro X (rad/s) - bias corrected
+	gy := (m.B2 - s.gyroBias[1]) * D2R // Gyro Y (rad/s) - bias corrected  
+	gz := (m.B3 - s.gyroBias[2]) * D2R // Gyro Z (rad/s) - bias corrected
+	ax := m.A1 // Accel X (g)
+	ay := m.A2 // Accel Y (g)
+	az := m.A3 // Accel Z (g)
+	mx := m.M2 // Mag X 
+	my := m.M1 // Mag Y 
 	mz := m.M3 // Mag Z 
-	
-	
-	// Accelerometer correction (if magnitude is reasonable)
-	accelMag := math.Sqrt(ax*ax + ay*ay + az*az)
-	if accelMag > 0.5 && accelMag < 2.0 && m.SValid {
-		// Normalize accelerometer
-		ax /= accelMag
-		ay /= accelMag
-		az /= accelMag
-		
-		// Calculate error between measured gravity and DCM's Z-axis
-		accelError := [3]float64{
-			ay*s.f33 - az*s.f32,
-			az*s.f31 - ax*s.f33,
-			ax*s.f32 - ay*s.f31,
-		}
-		
-		// Apply PI feedback
-		for i := 0; i < 3; i++ {
-			omegaP[i] = accelError[i] * kp
-			omegaI[i] += accelError[i] * ki * dt
-		}
-	}
-	
-	// Magnetometer correction (if valid)
-	magError := 0.0
-	if m.MValid && (mx != 0 || my != 0 || mz != 0) {
-		// Normalize magnetometer
-		magMag := math.Sqrt(mx*mx + my*my + mz*mz)
-		if magMag > 0 {
-			mx /= magMag
-			my /= magMag
-			mz /= magMag
-			
-
-			
-			xh := mx*math.Cos(s.pitch) + mz*math.Sin(s.pitch)
-			yh := mx*math.Sin(s.roll)*math.Sin(s.pitch) + my*math.Cos(s.roll) - mz*math.Sin(s.roll)*math.Cos(s.pitch)
-			magHeading := math.Atan2(yh, xh)
-			
-			// Calculate DCM heading
-			dcmHeading := math.Atan2(s.f21, s.f11)
-			
-			// Calculate heading error with wrap-around
-			magError = magHeading - dcmHeading
-			if magError > math.Pi {
-				magError -= 2 * math.Pi
-			}
-			if magError < -math.Pi {
-				magError += 2 * math.Pi
-			}
-			magError *= kpMag 
-		}
-	}
-	
-	// Combine all corrections with gyro rates
-	omega := [3]float64{
-		gx + omegaP[0] + omegaI[0],
-		gy + omegaP[1] + omegaI[1],
-		gz + omegaP[2] + omegaI[2] + magError,
-	}
-	
-	// Create update matrix (small angle approximation)
-	update := [3][3]float64{
-		{1, -omega[2]*dt, omega[1]*dt},
-		{omega[2]*dt, 1, -omega[0]*dt},
-		{-omega[1]*dt, omega[0]*dt, 1},
-	}
-	
-	// Update DCM matrix
-	temp := dcm
-	for i := 0; i < 3; i++ {
-		for j := 0; j < 3; j++ {
-			dcm[i][j] = temp[i][0]*update[0][j] + temp[i][1]*update[1][j] + temp[i][2]*update[2][j]
-		}
-	}
-	
-	// Normalize the DCM matrix
-	dcm=normalizeMatrix(dcm)
-
-	// Extract angles directly from DCM (skip quaternion conversion)
-	s.roll = math.Atan2(dcm[1][2], dcm[2][2])     // atan2(f23, f33)
-	s.pitch = -math.Asin(dcm[0][2])               // -asin(f13)  
-	s.heading = math.Atan2(dcm[0][1], dcm[0][0])  // atan2(f12, f11)
 
 
-	// Update DCM matrix elements directly
-	s.f11, s.f12, s.f13 = dcm[0][0], dcm[0][1], dcm[0][2]
-	s.f21, s.f22, s.f23 = dcm[1][0], dcm[1][1], dcm[1][2]
-	s.f31, s.f32, s.f33 = dcm[2][0], dcm[2][1], dcm[2][2]
-
-	s.F0, s.F1, s.F2, s.F3 = rotationMatrixToQuaternion(dcm)
+	// Apply magnetometer calibration if enabled
+    if s.magCalibrated {
+        mx = (mx - s.magOffset[0]) * s.magScale[0]
+        my = (my - s.magOffset[1]) * s.magScale[1]
+        mz = (mz - s.magOffset[2]) * s.magScale[2]
+    }
 	
+	
+	s.roll = math.Atan2(ay, az)
+	s.pitch = math.Atan2(-ax, math.Sqrt(ay*ay + az*az))
+
+    m1 := mx * math.Cos(s.pitch) + my * math.Sin(s.roll);           
+    m2 := mx * math.Sin(s.roll) * math.Sin(s.pitch) + my * math.Cos(s.roll) - mz * math.Sin(s.roll) * math.Cos(s.pitch);
+    s.heading = math.Atan2(m2, m1);
+	for s.heading < 0 {
+		s.heading += 2 * Pi
+	}
+	for s.heading >= 2*Pi {
+		s.heading -= 2 * Pi
+	}
+	
+	s.F0, s.F1, s.F2, s.F3 = toQuaternion(s.roll, s.pitch, s.heading)
+	s.calcRotationMatrices()
 
 	//these were fixed to use body-fixed accelerations instead of inertial accelerations
 	// Initialize Slip/Skid, Rate of Turn, and GLoad.
 	s.slipSkid = math.Atan2(-m.A2, m.A3) * R2D
 	s.turnRate = 0
 	s.gLoad = m.A3 
-	log.Printf("roll %f pitch %f yaw %f slip %f gload %f", s.roll*R2D, s.pitch*R2D, s.heading*R2D, s.slipSkid, s.gLoad)
+	log.Printf("roll %f pitch %f yaw %f slip %f gload %f ax %f ay %f az %f gx %f gy %f gz %f mx %f my %f mz %f", s.roll*R2D, s.pitch*R2D, s.heading*R2D, s.slipSkid, s.gLoad, ax, ay, az, gx, gy, gz, mx, my, mz)
 	
 	updateLogMap(s, m, s.logMap)
 
@@ -378,7 +361,14 @@ func (s *SimpleState) Update(m *Measurement) {
 
 
 
-
+// ResetGyroCal triggers a new gyro calibration
+func (s *SimpleState) ResetGyroCal() {
+	s.needsGyroCal = true
+	s.gyroCalSamples = 0
+	s.gyroCalSum = [3]float64{0, 0, 0}
+	s.gyroBias = [3]float64{0, 0, 0}
+	log.Printf("AHRS: Gyro calibration reset - keep IMU stationary!")
+}
 
 
 
