@@ -3,20 +3,18 @@ package ahrs
 import (
 	"log"
 	"math"
-//	"fmt"
-//	"github.com/skelterjohn/go.matrix"
 )
 
 const (
 	minDT                      = 1e-6 // Below this time interval, don't recalculate
 	maxDT                      = 10.0 // Above this time interval, re-initialize--too stale
 	Pi      = math.Pi
-	G       = 32.1740
+	G       = 32.1740      //ft/s2
 	Small   = 1e-9
 	Big     = 1e9
 	R2D     = 180 / Pi
 	D2R		= Pi / 180
-	Invalid float64  = 9999999 // 2**15-1
+	Invalid float64  = 9999999 // large
 	gyroCalDuration = 200  // Number of samples to collect (2 seconds at 100Hz)
 )
 
@@ -24,54 +22,40 @@ type State struct {
 		T float64 // Time when state last updated
 }
 
+// SimpleState now implements the Madgwick AHRS algorithm using quaternions
+// Renamed for drop-in compatibility but uses Madgwick internally
 type SimpleState struct {
 	State
 	T float64 // Time when state last updated
 	tW                            float64                // Time of last GPS reading
-	roll, pitch, heading          float64                // Fused attitude, Rad
-	slipSkid                      float64                // Slip/Skid Angle, Rad
-	gLoad                         float64                // G Load, G vertical
-	turnRate                      float64                // turn rate, Rad/s
 
-	// State vector (6x1): [roll, pitch, yaw, bias_x, bias_y, bias_z]
-	x [6]float64
-	
-	// State covariance matrix (6x6)
-	P [6][6]float64
-	
-	// Process noise covariance (6x6)
-	Q [6][6]float64
+	// Quaternion representing orientation (w, x, y, z) - Madgwick implementation
+	q0, q1, q2, q3 float64
+	gLoad, slipSkid, turnRate, heading float64
 
+	// Madgwick filter parameters
+	beta           float64  // Algorithm gain (proportional to gyro measurement error)
 	
-	// Sensor characteristics
-	accelNoise    float64  // Accelerometer noise variance
-	gyroNoise     float64  // Gyro noise variance  
-	magNoise      float64  // Magnetometer noise variance
-	gpsNoise      float64  // GPS heading noise variance
-	biasStability float64  // Gyro bias random walk
-	accelThreshold float64     // Allow ±0.3g deviation from 1g
-	magThreshold    float64     // Allow ±20% variation in mag magnitude
-
+	
 	// System state
 	initialized bool
 	valid       bool
 	lastUpdate  float64
 
-
-	dcm						  [3][3]float64
 	needsInitialization           bool                   // Rather than computing, initialize
 	logMap                        map[string]interface{} // Map only for analysis/debugging
+	
 	// Add gyro bias fields
 	gyroBias                      [3]float64             // Gyro bias in deg/s (B1, B2, B3)
 	needsGyroCal                  bool                   // Flag to trigger gyro calibration
 	gyroCalSamples               int                    // Number of calibration samples collected
 	gyroCalSum                   [3]float64             // Sum of gyro readings during calibration
+	
 	// Add magnetometer calibration
     magOffset                     [3]float64  // Hard iron offsets
     magScale                      [3]float64  // Soft iron scale factors
     magCalibrated                 bool        // Whether mag calibration is applied
 }
-
 
 type Measurement struct { // Order here also defines order in the matrices below
 	UValid, WValid, SValid, MValid bool // Do we have valid airspeed, GPS, accel/gyro, and magnetometer readings?
@@ -81,50 +65,37 @@ type Measurement struct { // Order here also defines order in the matrices below
 	TW, TU, T  float64 // Timestamp of GPS, airspeed and sensor readings
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 /////////////////////////////////////////////////////////////////////////
 // Constructor functions
 /////////////////////////////////////////////////////////////////////////
 
-//NewSimpleAHRS returns a new Simple AHRS object.
+//NewSimpleAHRS returns a new Simple AHRS object (now using Madgwick algorithm).
 // It is initialized with a beginning sensor orientation quaternion f0.
-func NewAHRS() (s *SimpleState) {
+func NewSimpleAHRS() (s *SimpleState) {
 	s = new(SimpleState)
 
 	s.needsInitialization = true
 	s.needsGyroCal = true
 
+	// Initialize quaternion to identity (no rotation)
+	s.q0, s.q1, s.q2, s.q3 = 1.0, 0.0, 0.0, 0.0
+	
+	// Initialize Madgwick filter parameters
+	s.beta = 0.1   // Algorithm gain (tune based on gyro noise characteristics)
+	
 	// Initialize magnetometer calibration with your values M2, M1, -M3 (mx, my, mz)
     s.magOffset = [3]float64{5154, 589, 1209}
     s.magScale = [3]float64{0.000158780565259, 0.000160901045857, 0.000143802128271}
     s.magCalibrated = true
 
-	// Initialize sensor noise parameters (tune these based on your sensors)
-	s.accelNoise =     0.1     // m/s² RMS
-	s.gyroNoise =      0.01    // rad/s RMS  
-	s.magNoise =       0.1     // normalized units
-	s.gpsNoise =       0.1     // radians
-	s.biasStability =  1e-6    // rad/s/√s
-	s.accelThreshold = 0.3     // Allow ±0.3g deviation from 1g
-	s.magThreshold =   0.2     // Allow ±20% variation in mag magnitude
-
-	// Initialize covariance matrices
-	s.initializeCovariances()
-
 	s.logMap = make(map[string]interface{})
 	updateLogMap(s, NewMeasurement(), s.logMap)
 	return
+}
+
+//NewAHRS returns a new Simple AHRS object (now using Madgwick algorithm).
+func NewAHRS() (s *SimpleState) {
+	return NewSimpleAHRS()
 }
 
 // NewMeasurement returns a pointer to an empty AHRS Measurement.
@@ -134,83 +105,22 @@ func NewMeasurement() *Measurement {
 	return m
 }
 
-
-
-// initializeCovariances sets up the initial covariance matrices
-func (s *SimpleState) initializeCovariances() {
-	// Initial state uncertainty (diagonal matrix)
-	// Higher uncertainty for initial attitude, lower for biases
-	initialAttitudeUncertainty := 0.5  // radians
-	initialBiasUncertainty := 0.1      // rad/s
-	
-	for i := 0; i < 6; i++ {
-		for j := 0; j < 6; j++ {
-			s.P[i][j] = 0
-		}
-	}
-
-	// Attitude uncertainties
-	s.P[0][0] = initialAttitudeUncertainty * initialAttitudeUncertainty // roll
-	s.P[1][1] = initialAttitudeUncertainty * initialAttitudeUncertainty // pitch  
-	s.P[2][2] = initialAttitudeUncertainty * initialAttitudeUncertainty // yaw
-	
-	// Bias uncertainties
-	s.P[3][3] = initialBiasUncertainty * initialBiasUncertainty // bias_x
-	s.P[4][4] = initialBiasUncertainty * initialBiasUncertainty // bias_y
-	s.P[5][5] = initialBiasUncertainty * initialBiasUncertainty // bias_z
-	
-	// Process noise matrix Q (will be scaled by dt in prediction)
-	for i := 0; i < 6; i++ {
-		for j := 0; j < 6; j++ {
-			s.Q[i][j] = 0
-		}
-	}
-	
-	// Attitude process noise (from gyro integration)
-	gyroVariance := s.gyroNoise * s.gyroNoise
-	s.Q[0][0] = gyroVariance // roll
-	s.Q[1][1] = gyroVariance // pitch
-	s.Q[2][2] = gyroVariance // yaw
-	
-	// Bias random walk
-	biasVariance := s.biasStability * s.biasStability
-	s.Q[3][3] = biasVariance // bias_x
-	s.Q[4][4] = biasVariance // bias_y  
-	s.Q[5][5] = biasVariance // bias_z
-}
-
-
-
-
-
-
-
-
-
-
-
 /////////////////////////////////////////////////////////////////////////
 // Initialization
 /////////////////////////////////////////////////////////////////////////
 
-
-
+// init initializes the filter with the first measurement
 func (s *SimpleState) init(m *Measurement) {
-	log.Printf("Initializing")
-	s.needsInitialization = false
+	log.Printf("Initializing Madgwick Filter")
 
 	s.T = m.T
 	s.tW = m.TW
 
+	// Extract accelerometer readings
 	ax, ay, az := m.A1, m.A2, m.A3
+	
+	// Extract magnetometer readings
 	mx, my, mz := m.M2, m.M1, -m.M3
-
-
-	s.roll = math.Atan2(ay, az)
-	s.pitch = math.Atan2(-ax, math.Sqrt(ay*ay + az*az))
-	s.x[0] = s.roll
-	s.x[1] = s.pitch
-
 
 	// Apply magnetometer calibration if enabled
     if s.magCalibrated {
@@ -219,92 +129,107 @@ func (s *SimpleState) init(m *Measurement) {
         mz = (mz - s.magOffset[2]) * s.magScale[2]
     }
 	
-	mmag:=math.Sqrt(mx*mx+my*my+mz*mz)
+	// Check magnetometer validity
+	mmag := math.Sqrt(mx*mx + my*my + mz*mz)
+	magValid := mmag >= 0.9 && mmag <= 1.1
 
-	//check if magnetometer data is invalid  (this works good!  Keeps outputs within calibration values)
-	if mmag < 0.9 || mmag > 1.1 {
-		mx, my, mz = 0, 0, 0
-		s.needsInitialization = true 
+	// Initialize orientation from accelerometer and magnetometer
+	if magValid {
+		// Use MARG (9-DOF) initialization
+		s.initializeMARG(ax, ay, az, mx, my, mz)
+	} else {
+		log.Printf("High magnetometer error")
 		return
 	}
 
-	if mx!=0 && my!=0 && mz!=0 {
-		//transform from body to inertial coordinates, pitch and roll only
-		m1 := mx * math.Cos(s.pitch) + my * math.Sin(s.roll) * math.Sin(s.pitch) + mz * math.Cos(s.roll) * math.Sin(s.pitch);           
-		m2 := my * math.Cos(s.roll) - mz * math.Sin(s.roll);
-		s.heading = math.Atan2(m2, m1);
-		for s.heading < 0 {
-			s.heading += 2 * Pi
-		}
-		for s.heading >= 2*Pi {
-			s.heading -= 2 * Pi
-		}
-	}
+	s.needsInitialization = false
 
-	s.x[2]=s.heading
-
-	// Initialize biases to zero
-	s.x[3] = 0 // bias_x
-	s.x[4] = 0 // bias_y  
-	s.x[5] = 0 // bias_z
+	roll, pitch, heading :=  s.updateEulerAngles()
 	
-	// Update DCM
-	s.updateDCM()
-
-	s.initialized = true
-	s.valid = true
-	s.lastUpdate = m.T
-
-	log.Printf("INIT: roll %f pitch %f yaw %f", s.roll*R2D, s.pitch*R2D, s.heading*R2D)
-	
-	//these were fixed to use body-fixed accelerations instead of inertial accelerations
-	// Initialize Slip/Skid, Rate of Turn, and GLoad.
-	s.slipSkid = math.Atan2(m.A2, m.A3)*R2D
-	s.turnRate = 0
-	s.gLoad = m.A3 
-	log.Printf("INIT: Slipskid %f turnrate %f gload %f", s.slipSkid, s.turnRate, s.gLoad)
-	updateLogMap(s, m, s.logMap)
-
+	log.Printf("AHRS: Initialized with q=[%.3f, %.3f, %.3f, %.3f] Roll: %.1f°, Pitch: %.1f°, Heading: %.1f°", s.q0, s.q1, s.q2, s.q3, roll*R2D, pitch*R2D, heading*R2D)
 }
 
 
-// calibrateGyro collects stationary gyro readings to estimate bias
+// initializeMARG initializes orientation using accelerometer and magnetometer (9-DOF)
+func (s *SimpleState) initializeMARG(ax, ay, az, mx, my, mz float64) {
+	// Normalize accelerometer
+	normA := math.Sqrt(ax*ax + ay*ay + az*az)
+	if normA > 0 {
+		ax /= normA
+		ay /= normA
+		az /= normA
+	}
+	
+	// Calculate initial roll and pitch from accelerometer
+	roll := math.Atan2(ay, az)
+	pitch := math.Atan2(ax, math.Sqrt(ay*ay + az*az))
+	
+	// Calculate initial yaw from magnetometer
+	// Transform magnetometer to horizontal plane
+	mxh := mx*math.Cos(pitch) + my*math.Sin(roll)*math.Sin(pitch) + mz*math.Cos(roll)*math.Sin(pitch)
+	myh := my*math.Cos(roll) - mz*math.Sin(roll)
+	
+	yaw := math.Atan2(myh, mxh)
+	
+	// Convert to quaternion
+	s.eulerToQuaternion(roll, pitch, yaw)
+}
+
+// eulerToQuaternion converts Euler angles to quaternion
+func (s *SimpleState) eulerToQuaternion(roll, pitch, yaw float64) {
+	// Convert to half angles
+	cr := math.Cos(roll * 0.5)
+	sr := math.Sin(roll * 0.5)
+	cp := math.Cos(pitch * 0.5)
+	sp := math.Sin(pitch * 0.5)
+	cy := math.Cos(yaw * 0.5)
+	sy := math.Sin(yaw * 0.5)
+	
+	// Calculate quaternion components
+	s.q0 = cr*cp*cy + sr*sp*sy
+	s.q1 = sr*cp*cy - cr*sp*sy
+	s.q2 = cr*sp*cy + sr*cp*sy
+	s.q3 = cr*cp*sy - sr*sp*cy
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Gyro calibration - collect stationary samples to estimate bias
 func (s *SimpleState) calibrateGyro(m *Measurement) bool {
-	if !s.needsGyroCal {
-		return true  // Calibration already complete
-	}
-	
-	// Check if gyro data is valid
 	if !m.SValid {
-		log.Printf("AHRS: Gyro calibration waiting for valid sensor data...")
-		return false
+		return false  // Can't calibrate without gyro data
 	}
 	
-	// Accumulate gyro readings
+	// Accumulate samples
 	s.gyroCalSum[0] += m.B1
-	s.gyroCalSum[1] += m.B2  
+	s.gyroCalSum[1] += m.B2
 	s.gyroCalSum[2] += m.B3
 	s.gyroCalSamples++
 	
-	// Log progress every 50 samples
-	if s.gyroCalSamples%50 == 0 {
-		log.Printf("AHRS: Gyro calibration progress: %d/%d samples", s.gyroCalSamples, gyroCalDuration)
-	}
-	
-	// Check if we have enough samples
 	if s.gyroCalSamples >= gyroCalDuration {
 		// Calculate average bias
 		s.gyroBias[0] = s.gyroCalSum[0] / float64(s.gyroCalSamples)
 		s.gyroBias[1] = s.gyroCalSum[1] / float64(s.gyroCalSamples)
 		s.gyroBias[2] = s.gyroCalSum[2] / float64(s.gyroCalSamples)
 		
-		s.needsGyroCal = false  // Mark calibration complete
-
-		s.x[3]=s.gyroBias[0] * D2R // Convert to rad/s
-		s.x[4]=s.gyroBias[1] * D2R
-		s.x[5]=s.gyroBias[2] * D2R
+		// Reset calibration state
+		s.needsGyroCal = false
+		s.gyroCalSamples = 0
+		s.gyroCalSum = [3]float64{0, 0, 0}
 		
-		log.Printf("AHRS: Gyro calibration complete!")
+		log.Printf("AHRS: Gyro calibration complete")
 		log.Printf("AHRS: Gyro biases: X=%.3f Y=%.3f Z=%.3f deg/s", 
 			s.gyroBias[0], s.gyroBias[1], s.gyroBias[2])
 		
@@ -313,7 +238,6 @@ func (s *SimpleState) calibrateGyro(m *Measurement) bool {
 	
 	return false  // Still calibrating
 }
-
 
 // ResetGyroCal triggers a new gyro calibration
 func (s *SimpleState) ResetGyroCal() {
@@ -355,694 +279,535 @@ func (s *SimpleState) ResetGyroCal() {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /////////////////////////////////////////////////////////////////////////
 // Run
 /////////////////////////////////////////////////////////////////////////
 
-
-
-
+// Compute performs both prediction and update steps
 func (s *SimpleState) Compute(m *Measurement) {
-
 	// First check if we need to calibrate gyro
 	if s.needsGyroCal {
 		gyroCalComplete := s.calibrateGyro(m)
 		if !gyroCalComplete {
+			log.Printf("Gyro Calibrating...")
 			return  // Don't run AHRS until gyro calibration is done
 		}
 	}
 
 	if s.needsInitialization {
+		log.Printf("AHRS Initializing...")
 		s.init(m)
-		log.Printf("INITIALIZATION BITCHESSSSSS!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 		return
 	}
 
-	// Calculate time step
-	dt := m.T - s.lastUpdate
-	if dt <= 0 || dt > maxDT {
-		log.Printf("Kalman DCM: Invalid dt=%.3f, reinitializing", dt)
-		s.initialized = false
-		s.needsInitialization = true
-		return
-	}
-	
-	// Prediction step
-	s.PredictKalman(m, dt)
-	
-	// Measurement updates
-	s.UpdateAccelerometer(m)
-	s.UpdateMagnetometer(m)
-	
-	// Update derived quantities
-	s.updateDerivedQuantities(m)
-	
-	s.lastUpdate = m.T
-	s.valid = true
+	s.Update(m)
+
+	// Update log map for debugging
+	updateLogMap(s, m, s.logMap)
 }
 
 
 
 
-// Predict performs the prediction step using gyroscope measurements
-func (s *SimpleState) PredictKalman(m *Measurement, dt float64) {
-	if dt <= 0 || dt > maxDT {
+
+
+// Madgwick AHRS algorithm implementation
+func (s *SimpleState) Update(m *Measurement) {
+	dt := m.T - s.T
+	dtw := m.TW - s.tW
+	log.Printf("dt %f dtw %f", dt, dtw)
+
+	if dt > maxDT || dtw > maxDT {
+		log.Printf("ERROR - timestep too large for AHRS")
+		s.init(m)
 		return
 	}
 	
-	if !m.SValid {
-		return // Need valid gyro data for prediction
-	}
-	
-	// Extract bias-corrected gyro rates (rad/s)
-	gx := (m.B1*D2R) - s.x[3] // gyro_x - bias_x
-	gy := (m.B2*D2R) - s.x[4] // gyro_y - bias_y  
-	gz := (m.B3*D2R) - s.x[5] // gyro_z - bias_z
-	
-	// Current attitude
-	roll, pitch:= s.x[0], s.x[1]
-	
-	// Predict new attitude using gyro rates
-	// This uses the small angle approximation for the rotation matrix
-	// For better accuracy, could use full DCM propagation
-	
-	// Body-to-Euler rate transformation matrix
-	sin_roll := math.Sin(roll)
-	cos_roll := math.Cos(roll)
-	sin_pitch := math.Sin(pitch)
-	cos_pitch := math.Cos(pitch)
-	tan_pitch := math.Tan(pitch)
-	
-	// Avoid singularity at ±90° pitch
-	if math.Abs(cos_pitch) < 0.01 {
-		cos_pitch = math.Copysign(0.01, cos_pitch)
-	}
-	
-	// Euler angle rates from body rates
-	roll_dot := gx + sin_roll*tan_pitch*gy + cos_roll*tan_pitch*gz
-	pitch_dot := cos_roll*gy - sin_roll*gz
-	yaw_dot := (sin_roll/cos_pitch)*gy + (cos_roll/cos_pitch)*gz
-	
-	// Update state (biases don't change in prediction)
-	s.x[0] += roll_dot * dt  // roll
-	s.x[1] += pitch_dot * dt // pitch
-	s.x[2] += yaw_dot * dt   // yaw
-	
-	// Normalize angles
-	s.x[2] = math.Mod(s.x[2], 2*math.Pi)
-	if s.x[2] < 0 {
-		s.x[2] += 2*math.Pi
+	if dt < minDT {
+		return  // Skip if time step too small
 	}
 
-	// Update attitude variables for compatibility
-	s.roll = s.x[0]
-	s.pitch = s.x[1]
-	s.heading = s.x[2]
+	// Extract and convert sensor data
+	gx := (m.B1 - s.gyroBias[0]) * D2R  // Convert to rad/s and remove bias
+	gy := (m.B2 - s.gyroBias[1]) * D2R
+	gz := (m.B3 - s.gyroBias[2]) * D2R
 	
-	// Jacobian of state transition (F matrix)
-	F := [6][6]float64{}
+	ax := m.A1
+	ay := m.A2  
+	az := m.A3
 	
-	// Identity for all states
-	for i := 0; i < 6; i++ {
-		F[i][i] = 1.0
-	}
-	
-	// Derivatives of Euler rates with respect to roll and pitch
-	sec_pitch := 1.0 / cos_pitch
-	
-	F[0][0] += dt * (cos_roll*tan_pitch*gy - sin_roll*tan_pitch*gz)
-	F[0][1] += dt * (sin_roll*sec_pitch*sec_pitch*gy + cos_roll*sec_pitch*sec_pitch*gz)
-	F[1][0] += dt * (-sin_roll*gy - cos_roll*gz)
-	F[2][0] += dt * ((cos_roll/cos_pitch)*gy - (sin_roll/cos_pitch)*gz)
-	F[2][1] += dt * ((sin_roll*sin_pitch/(cos_pitch*cos_pitch))*gy + (cos_roll*sin_pitch/(cos_pitch*cos_pitch))*gz)
-	
-	// Derivatives with respect to biases (negative because we subtract bias)
-	F[0][3] = -dt
-	F[1][4] = -dt * cos_roll
-	F[1][5] = dt * sin_roll
-	F[2][4] = -dt * sin_roll / cos_pitch
-	F[2][5] = -dt * cos_roll / cos_pitch
-	
-	// Update covariance: P = F*P*F' + Q*dt
-	var temp [6][6]float64
-	var newP [6][6]float64
-	
-	// temp = F * P
-	for i := 0; i < 6; i++ {
-		for j := 0; j < 6; j++ {
-			temp[i][j] = 0
-			for k := 0; k < 6; k++ {
-				temp[i][j] += F[i][k] * s.P[k][j]
-			}
-		}
-	}
-	
-	// newP = temp * F'
-	for i := 0; i < 6; i++ {
-		for j := 0; j < 6; j++ {
-			newP[i][j] = 0
-			for k := 0; k < 6; k++ {
-				newP[i][j] += temp[i][k] * F[j][k] // F[j][k] is F'[k][j]
-			}
-		}
-	}
-	
-	// Add process noise: P = P + Q*dt
-	for i := 0; i < 6; i++ {
-		for j := 0; j < 6; j++ {
-			s.P[i][j] = newP[i][j] + s.Q[i][j]*dt
-		}
-	}
-	
-	// Update DCM
-	s.updateDCM()
-}
+	mx := m.M2
+	my := m.M1
+	mz := -m.M3
 
-// UpdateAccelerometer performs measurement update using accelerometer
-func (s *SimpleState) UpdateAccelerometer(m *Measurement) {
-	if !m.SValid {
-		return
-	}
-	
-	ax, ay, az := m.A1, m.A2, m.A3
-	
-	// Check if accelerometer reading is reasonable (close to 1g)
-	accel_mag := math.Sqrt(ax*ax + ay*ay + az*az)
-	if math.Abs(accel_mag - 1.0) > s.accelThreshold {
-		return // Reject measurement - likely in acceleration
-	}
-	
-	// Expected gravity vector in body frame from current attitude
-	roll, pitch := s.x[0], s.x[1]
-	
-	// Predicted accelerometer readings (gravity vector rotated to body frame)
-	ax_pred := -math.Sin(pitch)
-	ay_pred := math.Sin(roll) * math.Cos(pitch)
-	az_pred := math.Cos(roll) * math.Cos(pitch)
-	
-	// Innovation (measurement residual)
-	innovation := [3]float64{
-		ax - ax_pred,
-		ay - ay_pred,  
-		az - az_pred,
-	}
-	
-	// Measurement Jacobian (H matrix) - derivatives of h(x) with respect to state
-	H := [3][6]float64{}
-	
-	// Derivatives with respect to roll
-	H[1][0] = math.Cos(roll) * math.Cos(pitch)   // day/droll
-	H[2][0] = -math.Sin(roll) * math.Cos(pitch)  // daz/droll
-	
-	// Derivatives with respect to pitch  
-	H[0][1] = -math.Cos(pitch)                    // dax/dpitch
-	H[1][1] = -math.Sin(roll) * math.Sin(pitch)  // day/dpitch
-	H[2][1] = -math.Cos(roll) * math.Sin(pitch)  // daz/dpitch
-	
-	// No dependence on yaw or biases for accelerometer
-	
-	// Measurement noise covariance
-	R := [3][3]float64{
-		{s.accelNoise * s.accelNoise, 0, 0},
-		{0, s.accelNoise * s.accelNoise, 0},
-		{0, 0, s.accelNoise * s.accelNoise},
-	}
-	
-	// Convert arrays to proper slice format for kalmanUpdate
-	innovation_slice := make([]float64, 3)
-	H_slice := make([][]float64, 3)
-	R_slice := make([][]float64, 3)
-	
-	for i := 0; i < 3; i++ {
-		innovation_slice[i] = innovation[i]
-		H_slice[i] = make([]float64, 6)
-		R_slice[i] = make([]float64, 3)
-		
-		for j := 0; j < 6; j++ {
-			H_slice[i][j] = H[i][j]
-		}
-		for j := 0; j < 3; j++ {
-			R_slice[i][j] = R[i][j]
-		}
-	}
-	
-	// Perform Kalman update
-	s.kalmanUpdate(innovation_slice, H_slice, R_slice, 3)
-}
-
-// UpdateMagnetometer performs measurement update using magnetometer
-func (s *SimpleState) UpdateMagnetometer(m *Measurement) {
-	if !m.MValid {
-		return
-	}
-	
-	mx, my, mz := m.M2, m.M1, -m.M3
-	
 	// Apply magnetometer calibration
 	if s.magCalibrated {
 		mx = (mx - s.magOffset[0]) * s.magScale[0]
 		my = (my - s.magOffset[1]) * s.magScale[1]
 		mz = (mz - s.magOffset[2]) * s.magScale[2]
 	}
-	
-	// Check magnetometer magnitude
-	mag_mag := math.Sqrt(mx*mx + my*my + mz*mz)
-	if mag_mag < (1.0-s.magThreshold) || mag_mag > (1.0+s.magThreshold) {
-		return // Reject measurement
+
+	// Check if we have valid magnetometer data
+	mmag := math.Sqrt(mx*mx + my*my + mz*mz)
+	magValid := m.MValid && mmag >= 0.9 && mmag <= 1.1
+
+	// Run the appropriate Madgwick algorithm
+	if magValid {
+		s.madgwickAHRS(gx, gy, gz, ax, ay, az, mx, my, mz, dt)
+	} else {
+		return
 	}
-	
-	// Normalize magnetometer reading
-	mx /= mag_mag
-	my /= mag_mag
-	mz /= mag_mag
-	
-	// Current attitude
-	roll, pitch := s.x[0], s.x[1] // Remove unused yaw variable
-	
-	// This is a simplified Jacobian - full implementation would need DCM derivatives
-	// For now, just update yaw based on tilt-compensated compass
-	roll_cos := math.Cos(roll)
-	roll_sin := math.Sin(roll)
-	pitch_cos := math.Cos(pitch)
-	pitch_sin := math.Sin(pitch)
-	
-	mx_comp := mx*pitch_cos + my*roll_sin*pitch_sin + mz*roll_cos*pitch_sin
-	my_comp := my*roll_cos - mz*roll_sin
-	measured_yaw := math.Atan2(my_comp, mx_comp)
-	
-	// Normalize measured yaw
-	for measured_yaw < 0 {
-		measured_yaw += 2*math.Pi
-	}
-	for measured_yaw >= 2*math.Pi {
-		measured_yaw -= 2*math.Pi
-	}
-	
-	// Handle yaw wraparound
-	yaw_innovation := measured_yaw - s.x[2] // Use s.x[2] directly
-	if yaw_innovation > math.Pi {
-		yaw_innovation -= 2*math.Pi
-	} else if yaw_innovation < -math.Pi {
-		yaw_innovation += 2*math.Pi
-	}
-	
-	// Simple update for yaw only
-	yaw_uncertainty := s.P[2][2] 
-	mag_noise_var := s.magNoise * s.magNoise
-	
-	kalman_gain := yaw_uncertainty / (yaw_uncertainty + mag_noise_var)
-	s.x[2] += kalman_gain * yaw_innovation
-	s.P[2][2] *= (1 - kalman_gain)
-	
-	// Normalize yaw
-	s.x[2] = math.Mod(s.x[2], 2*math.Pi)
-	if s.x[2] < 0 {
-		s.x[2] += 2*math.Pi
-	}
-	
-	// Update heading variable for compatibility
-	s.heading = s.x[2]
+
+	// Update timing
+	s.T = m.T
+	s.tW = m.TW
+
+	// Update derived quantities
+	s.updateDerivedQuantities(m)
 }
 
-// kalmanUpdate performs the Kalman filter measurement update
-func (s *SimpleState) kalmanUpdate(innovation []float64, H [][]float64, R [][]float64, meas_size int) {
-	// S = H*P*H' + R (innovation covariance)
-	var HPH [3][3]float64
-	var S [3][3]float64
+// madgwickAHRS implements the full 9-DOF Madgwick algorithm with magnetometer
+func (s *SimpleState) madgwickAHRS(gx, gy, gz, ax, ay, az, mx, my, mz, dt float64) {
+	// Local system variables
+	rNorm := 0.0
+	s_x, s_y, s_z := 0.0, 0.0, 0.0  // Sensor frame direction cosines
+	qDot1, qDot2, qDot3, qDot4 := 0.0, 0.0, 0.0, 0.0  // Quaternion derivative
+	hx, hy, bx, bz := 0.0, 0.0, 0.0, 0.0
 	
-	// HPH = H * P * H'
-	for i := 0; i < meas_size; i++ {
-		for j := 0; j < meas_size; j++ {
-			HPH[i][j] = 0
-			for k := 0; k < 6; k++ {
-				for l := 0; l < 6; l++ {
-					HPH[i][j] += H[i][k] * s.P[k][l] * H[j][l]
-				}
-			}
-			S[i][j] = HPH[i][j] + R[i][j]
-		}
+	// Use IMU algorithm if magnetometer measurement invalid
+	if !((mx == 0.0) && (my == 0.0) && (mz == 0.0)) {
+		// Normalise accelerometer measurement
+		aNorm := math.Sqrt(ax*ax + ay*ay + az*az)
+		ax /= aNorm
+		ay /= aNorm
+		az /= aNorm
+
+		// Normalise magnetometer measurement
+		mNorm := math.Sqrt(mx*mx + my*my + mz*mz)
+		mx /= mNorm
+		my /= mNorm
+		mz /= mNorm
+
+		// Auxiliary variables to avoid repeated arithmetic
+		_2q0mx := 2.0 * s.q0 * mx
+		_2q0my := 2.0 * s.q0 * my
+		_2q0mz := 2.0 * s.q0 * mz
+		_2q1mx := 2.0 * s.q1 * mx
+		_2q0 := 2.0 * s.q0
+		_2q1 := 2.0 * s.q1
+		_2q2 := 2.0 * s.q2
+		_2q3 := 2.0 * s.q3
+		_2q0q2 := 2.0 * s.q0 * s.q2
+		_2q2q3 := 2.0 * s.q2 * s.q3
+		q0q0 := s.q0 * s.q0
+		q0q1 := s.q0 * s.q1
+		q0q2 := s.q0 * s.q2
+		q0q3 := s.q0 * s.q3
+		q1q1 := s.q1 * s.q1
+		q1q2 := s.q1 * s.q2
+		q1q3 := s.q1 * s.q3
+		q2q2 := s.q2 * s.q2
+		q2q3 := s.q2 * s.q3
+		q3q3 := s.q3 * s.q3
+
+		// Reference direction of Earth's magnetic field
+		hx = mx * q0q0 - _2q0my * s.q3 + _2q0mz * s.q2 + mx * q1q1 + _2q1 * my * s.q2 + _2q1 * mz * s.q3 - mx * q2q2 - mx * q3q3
+		hy = _2q0mx * s.q3 + my * q0q0 - _2q0mz * s.q1 + _2q1mx * s.q2 - my * q1q1 + my * q2q2 + _2q2 * mz * s.q3 - my * q3q3
+		_2bx := math.Sqrt(hx * hx + hy * hy)
+		bx = _2bx * 0.5
+		bz = -_2q0mx * s.q2 + _2q0my * s.q1 + mz * q0q0 + _2q1mx * s.q3 - mz * q1q1 + _2q2 * my * s.q3 - mz * q2q2 + mz * q3q3
+		_4bx := 2.0 * bx
+		_4bz := 2.0 * bz
+		_8bx := 4.0 * bx
+		_8bz := 4.0 * bz
+
+		// Gradient decent algorithm corrective step
+		s_x = -_2q2 * (2.0 * q1q3 - _2q0q2 - ax) + _2q1 * (2.0 * q0q1 + _2q2q3 - ay) - _4bz * s.q2 * (_4bx * (0.5 - q2q2 - q3q3) + _4bz * (q1q3 - q0q2) - mx) + (-_4bx * s.q3 + _4bz * s.q1) * (_4bx * (q1q2 - q0q3) + _4bz * (q0q1 + q2q3) - my) + _4bx * s.q2 * (_4bx * (q0q2 + q1q3) + _4bz * (0.5 - q1q1 - q2q2) - mz)
+		s_y = _2q3 * (2.0 * q1q3 - _2q0q2 - ax) + _2q0 * (2.0 * q0q1 + _2q2q3 - ay) - 4.0 * s.q1 * (1.0 - 2.0 * q1q1 - 2.0 * q2q2 - az) + _4bz * s.q3 * (_4bx * (0.5 - q2q2 - q3q3) + _4bz * (q1q3 - q0q2) - mx) + (_4bx * s.q2 + _4bz * s.q0) * (_4bx * (q1q2 - q0q3) + _4bz * (q0q1 + q2q3) - my) + (_4bx * s.q3 - _8bz * s.q1) * (_4bx * (q0q2 + q1q3) + _4bz * (0.5 - q1q1 - q2q2) - mz)
+		s_z = -_2q0 * (2.0 * q1q3 - _2q0q2 - ax) + _2q3 * (2.0 * q0q1 + _2q2q3 - ay) - 4.0 * s.q2 * (1.0 - 2.0 * q1q1 - 2.0 * q2q2 - az) + (-_8bx * s.q2 - _4bz * s.q0) * (_4bx * (0.5 - q2q2 - q3q3) + _4bz * (q1q3 - q0q2) - mx) + (_4bx * s.q1 + _4bz * s.q3) * (_4bx * (q1q2 - q0q3) + _4bz * (q0q1 + q2q3) - my) + (_4bx * s.q0 - _8bz * s.q2) * (_4bx * (q0q2 + q1q3) + _4bz * (0.5 - q1q1 - q2q2) - mz)
+		s_w := -_2q1 * (2.0 * q1q3 - _2q0q2 - ax) - _2q2 * (2.0 * q0q1 + _2q2q3 - ay) + _4bz * s.q1 * (_4bx * (0.5 - q2q2 - q3q3) + _4bz * (q1q3 - q0q2) - mx) + (-_4bx * s.q0 + _4bz * s.q2) * (_4bx * (q1q2 - q0q3) + _4bz * (q0q1 + q2q3) - my) + _4bx * s.q1 * (_4bx * (q0q2 + q1q3) + _4bz * (0.5 - q1q1 - q2q2) - mz)
+		rNorm = math.Sqrt(s_w*s_w + s_x*s_x + s_y*s_y + s_z*s_z) // normalise step magnitude
+		s_w /= rNorm
+		s_x /= rNorm
+		s_y /= rNorm
+		s_z /= rNorm
+
+		// Apply feedback step
+		qDot1 = 0.5*(-s.q1*gx - s.q2*gy - s.q3*gz) - s.beta*s_w
+		qDot2 = 0.5*(s.q0*gx + s.q2*gz - s.q3*gy) - s.beta*s_x
+		qDot3 = 0.5*(s.q0*gy - s.q1*gz + s.q3*gx) - s.beta*s_y
+		qDot4 = 0.5*(s.q0*gz + s.q1*gy - s.q2*gx) - s.beta*s_z
+	} else {
+		return
 	}
-	
-	// Invert S (for 3x3 matrix)
-	var S_inv [3][3]float64
-	det := S[0][0]*(S[1][1]*S[2][2] - S[1][2]*S[2][1]) -
-		  S[0][1]*(S[1][0]*S[2][2] - S[1][2]*S[2][0]) +
-		  S[0][2]*(S[1][0]*S[2][1] - S[1][1]*S[2][0])
-	
-	if math.Abs(det) < 1e-10 {
-		return // Singular matrix, skip update
-	}
-	
-	S_inv[0][0] = (S[1][1]*S[2][2] - S[1][2]*S[2][1]) / det
-	S_inv[0][1] = (S[0][2]*S[2][1] - S[0][1]*S[2][2]) / det
-	S_inv[0][2] = (S[0][1]*S[1][2] - S[0][2]*S[1][1]) / det
-	S_inv[1][0] = (S[1][2]*S[2][0] - S[1][0]*S[2][2]) / det
-	S_inv[1][1] = (S[0][0]*S[2][2] - S[0][2]*S[2][0]) / det
-	S_inv[1][2] = (S[0][2]*S[1][0] - S[0][0]*S[1][2]) / det
-	S_inv[2][0] = (S[1][0]*S[2][1] - S[1][1]*S[2][0]) / det
-	S_inv[2][1] = (S[0][1]*S[2][0] - S[0][0]*S[2][1]) / det
-	S_inv[2][2] = (S[0][0]*S[1][1] - S[0][1]*S[1][0]) / det
-	
-	// K = P*H'*S_inv (Kalman gain)
-	var K [6][3]float64
-	for i := 0; i < 6; i++ {
-		for j := 0; j < meas_size; j++ {
-			K[i][j] = 0
-			for k := 0; k < 6; k++ {
-				for l := 0; l < meas_size; l++ {
-					K[i][j] += s.P[i][k] * H[l][k] * S_inv[l][j]
-				}
-			}
-		}
-	}
-	
-	// Update state: x = x + K*innovation
-	for i := 0; i < 6; i++ {
-		for j := 0; j < meas_size; j++ {
-			s.x[i] += K[i][j] * innovation[j]
-		}
-	}
-	
-	// Update covariance: P = P - K*H*P
-	var KH [6][6]float64
-	for i := 0; i < 6; i++ {
-		for j := 0; j < 6; j++ {
-			KH[i][j] = 0
-			for k := 0; k < meas_size; k++ {
-				KH[i][j] += K[i][k] * H[k][j]
-			}
-		}
-	}
-	
-	for i := 0; i < 6; i++ {
-		for j := 0; j < 6; j++ {
-			temp := 0.0
-			for k := 0; k < 6; k++ {
-				temp += KH[i][k] * s.P[k][j]
-			}
-			s.P[i][j] -= temp
-		}
-	}
-	
-	// Ensure P remains positive definite (add small diagonal term if needed)
-	for i := 0; i < 6; i++ {
-		if s.P[i][i] < 1e-12 {
-			s.P[i][i] = 1e-12
-		}
-	}
-	
-	// Update attitude variables for compatibility
-	s.roll = s.x[0]
-	s.pitch = s.x[1]
-	s.heading = s.x[2]
+
+	// Integrate rate of change of quaternion to yield quaternion
+	s.q0 += qDot1 * dt
+	s.q1 += qDot2 * dt
+	s.q2 += qDot3 * dt
+	s.q3 += qDot4 * dt
+
+	// Normalise quaternion
+	rNorm = math.Sqrt(s.q0*s.q0 + s.q1*s.q1 + s.q2*s.q2 + s.q3*s.q3)
+	s.q0 /= rNorm
+	s.q1 /= rNorm
+	s.q2 /= rNorm
+	s.q3 /= rNorm
 }
 
-// updateDCM updates the DCM from current Euler angles
-func (s *SimpleState) updateDCM() {
-	s.dcm = eulerToDCM(s.x[0], s.x[1], s.x[2])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// updateEulerAngles converts quaternion to Euler angles
+func (s *SimpleState) updateEulerAngles() (roll float64, pitch float64, heading float64) {
+	// Roll (x-axis rotation)
+	sinr_cosp := 2 * (s.q0*s.q1 + s.q2*s.q3)
+	cosr_cosp := 1 - 2*(s.q1*s.q1 + s.q2*s.q2)
+	roll = math.Atan2(sinr_cosp, cosr_cosp)
+
+	// Pitch (y-axis rotation)
+	sinp := 2 * (s.q0*s.q2 - s.q3*s.q1)
+	pitch = 0
+	if math.Abs(sinp) >= 1 {
+		if sinp > 0 {
+			pitch = math.Pi / 2 // 90 degrees
+		} else {
+			pitch = -math.Pi / 2 // -90 degrees
+		}
+	} else {
+		pitch = math.Asin(sinp)
+	}
+
+	// Yaw (z-axis rotation)
+	siny_cosp := 2 * (s.q0*s.q3 + s.q1*s.q2)
+	cosy_cosp := 1 - 2*(s.q2*s.q2 + s.q3*s.q3)
+	heading = math.Atan2(siny_cosp, cosy_cosp)
+	
+	// Ensure heading is in [0, 2π] range
+	for heading < 0 {
+		heading += 2 * Pi
+	}
+	for heading >= 2*Pi {
+		heading -= 2 * Pi
+	}
+	return roll, pitch, heading
 }
 
+
+
+
+
+
+
+
+
+// updateDCM updates the Direction Cosine Matrix from quaternion
+//func (s *SimpleState) updateDCM() {
+	// Convert quaternion to DCM
+//	q0q0 := s.q0 * s.q0
+//	q0q1 := s.q0 * s.q1
+//	q0q2 := s.q0 * s.q2
+//	q0q3 := s.q0 * s.q3
+//	q1q1 := s.q1 * s.q1
+//	q1q2 := s.q1 * s.q2
+//	q1q3 := s.q1 * s.q3
+//	q2q2 := s.q2 * s.q2
+//	q2q3 := s.q2 * s.q3
+//	q3q3 := s.q3 * s.q3
+//
+//	s.dcm[0][0] = q0q0 + q1q1 - q2q2 - q3q3
+//	s.dcm[0][1] = 2*(q1q2 - q0q3)
+//	s.dcm[0][2] = 2*(q1q3 + q0q2)
+//	s.dcm[1][0] = 2*(q1q2 + q0q3)
+//	s.dcm[1][1] = q0q0 - q1q1 + q2q2 - q3q3
+//	s.dcm[1][2] = 2*(q2q3 - q0q1)
+//	s.dcm[2][0] = 2*(q1q3 - q0q2)
+//	s.dcm[2][1] = 2*(q2q3 + q0q1)
+//	s.dcm[2][2] = q0q0 - q1q1 - q2q2 + q3q3
+//}
 
 // updateDerivedQuantities calculates slip/skid, turn rate, g-load
 func (s *SimpleState) updateDerivedQuantities(m *Measurement) {
 	if !m.SValid {
 		return
 	}
-	
+
 	// G-load is the magnitude of acceleration
-	ax, ay, az := m.A1, m.A2, m.A3
-	s.gLoad = math.Sqrt(ax*ax + ay*ay + az*az)
-	
+	_, ay, az := m.A1, m.A2, m.A3
+	s.gLoad = 0.9*s.gLoad + 0.1*az
+
 	// Slip/skid angle (simplified)
-	s.slipSkid = math.Atan2(-ay, az) * R2D
-	
+	s.slipSkid = 0.9*s.slipSkid + 0.1 * math.Atan2(-ay, az) * R2D
+
 	// Turn rate from gyro (bias corrected)
-	s.turnRate = ((m.B3*D2R) - s.x[5]) * R2D // Convert back to deg/s
+	s.turnRate = 0.9*s.turnRate + 0.1*((m.B3*D2R) - s.gyroBias[2]*D2R) * R2D // Convert back to deg/s
 }
 
+// Valid returns whether the current state is a valid estimate
+func (s *SimpleState) Valid() (ok bool) {
+	// Check for NaN in quaternion
+	if math.IsNaN(s.q0) || math.IsNaN(s.q1) || math.IsNaN(s.q2) || math.IsNaN(s.q3) {
+		return false
+	}
+	
+	// Check quaternion magnitude (should be close to 1)
+	qMag := math.Sqrt(s.q0*s.q0 + s.q1*s.q1 + s.q2*s.q2 + s.q3*s.q3)
+	if math.Abs(qMag - 1.0) > 0.1 {
+		return false
+	}
+	
+	return !s.needsInitialization
+}
 
+// Reset restarts the algorithm from scratch
+func (s *SimpleState) Reset() {
+	s.needsInitialization = true
+	s.q0, s.q1, s.q2, s.q3 = 1.0, 0.0, 0.0, 0.0
+}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-func (s *SimpleState) Predict(t float64) {
+// RollPitchHeading returns the current attitude values
+func (s *SimpleState) RollPitchHeading() (roll float64, pitch float64, heading float64) {
+	roll, pitch, heading = s.updateEulerAngles()
 	return
 }
 
-// Update performs the AHRSSimple AHRS computations.
-// The idea behind the Simple AHRS algorithm is to use the GPS to compute what the accelerometer should show
-// and then to create a rotation matrix to map the measured accelerometer vector onto this vector and the
-// speed vector (GPS Track) onto the sensor x-axis.  Then the gyro is used to further improve this estimate.
-// This is really a poor-man's sensor fusion algorithm.  The proper way to do this is with a Kalman Filter,
-// but this approach is simpler and easier to debug, and should be good enough for most flight conditions.
-//
-// It is a step on the way to the full Kalman Filter implementation, a bit more obvious what's going on so
-// the math and stratux integration can be more easily developed and debugged.
-
-// SimpleDCM implements a Direction Cosine Matrix AHRS algorithm
-
-func (s *SimpleState) Update(m *Measurement) {
-
-
-	dt := m.T - s.T      //sensor delta-T
-	dtw := m.TW - s.tW   //gps delta-T
-
-	if dt > maxDT || dtw > maxDT {
-		s.init(m)
-		return
-	}
-	
-	// Extract sensor data (assuming Measurement has these fields)
-	// You'll need to adjust these field names to match the actual Measurement struct
-	gx := (m.B1 - s.gyroBias[0]) * D2R // Gyro X (rad/s) - bias corrected
-	gy := (m.B2 - s.gyroBias[1]) * D2R // Gyro Y (rad/s) - bias corrected  
-	gz := (m.B3 - s.gyroBias[2]) * D2R // Gyro Z (rad/s) - bias corrected
-	ax := m.A1 // Accel X (g)
-	ay := m.A2 // Accel Y (g)
-	az := m.A3 // Accel Z (g)
-	mx := m.M2 // Mag X 
-	my := m.M1 // Mag Y 
-	mz := -m.M3 // Mag Z 
-
-
-	// Apply magnetometer calibration if enabled
-    if s.magCalibrated {
-        mx = (mx - s.magOffset[0]) * s.magScale[0]
-        my = (my - s.magOffset[1]) * s.magScale[1]
-        mz = (mz - s.magOffset[2]) * s.magScale[2]
-    }
-	
-	mmag := math.Sqrt(mx*mx+my*my+mz*mz)
-
-	//check if magnetometer data is invalid  (this works good!  Keeps outputs within calibration values)
-	if mmag < 0.9 || mmag > 1.1 {
-		mx, my, mz = 0, 0, 0
-	}
-
-	
-	
-	s.roll = math.Atan2(ay, az)
-	s.pitch = math.Atan2(-ax, math.Sqrt(ay*ay + az*az))
-
-	if mx!=0 && my!=0 && mz!=0 {
-		//transform from body to inertial coordinates, pitch and roll only
-		m1 := mx * math.Cos(s.pitch) + my * math.Sin(s.roll) * math.Sin(s.pitch) + mz * math.Cos(s.roll) * math.Sin(s.pitch);           
-		m2 := my * math.Cos(s.roll) - mz * math.Sin(s.roll);
-		s.heading = math.Atan2(m2, m1);
-		for s.heading < 0 {
-			s.heading += 2 * Pi
-		}
-		for s.heading >= 2*Pi {
-			s.heading -= 2 * Pi
-		}
-	}
-
-	//these were fixed to use body-fixed accelerations instead of inertial accelerations
-	// Initialize Slip/Skid, Rate of Turn, and GLoad.
-	s.slipSkid = math.Atan2(-m.A2, m.A3) * R2D
-	s.turnRate = 0
-	s.gLoad = m.A3 
-	log.Printf("roll %f pitch %f yaw %f slip %f gload %f ax %f ay %f az %f gx %f gy %f gz %f mx %f my %f mz %f", s.roll*R2D, s.pitch*R2D, s.heading*R2D, s.slipSkid, s.gLoad, ax, ay, az, gx, gy, gz, mx, my, mz)
-	
-	updateLogMap(s, m, s.logMap)
-
-	s.T = m.T
-	s.tW = m.TW
-
+// MagHeading returns the magnetic heading in degrees
+func (s *SimpleState) MagHeading() (hdg float64) {
+	_, _, hdg = s.updateEulerAngles()
+	return hdg
 }
 
-
-
-
-
-
-
-
-
-
-
-// eulerToDCM calculates the Direction Cosine Matrix from Euler angles
-// phi = roll, theta = pitch, psi = yaw (all in radians)
-// Returns a 3x3 DCM that rotates from body frame to earth frame
-func eulerToDCM(phi, theta, psi float64) [3][3]float64 {
-    // Precompute trig functions
-    cphi := math.Cos(phi)
-    sphi := math.Sin(phi)
-    ctheta := math.Cos(theta)
-    stheta := math.Sin(theta)
-    cpsi := math.Cos(psi)
-    spsi := math.Sin(psi)
-    
-    // Standard aerospace DCM (Z-Y-X rotation sequence)
-    // This is the most common convention for aircraft
-    dcm := [3][3]float64{
-        {ctheta * cpsi, ctheta * spsi, -stheta},
-        {sphi * stheta * cpsi - cphi * spsi, sphi * stheta * spsi + cphi * cpsi, sphi * ctheta},
-        {cphi * stheta * cpsi + sphi * spsi, cphi * stheta * spsi - sphi * cpsi, cphi * ctheta},
-    }
-    
-    return dcm
+// SlipSkid returns the slip/skid angle in degrees
+func (s *SimpleState) SlipSkid() (slipSkid float64) {
+	return s.slipSkid
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
- 
-
-
-
-
-
-// normalizeMatrix orthonormalizes the DCM matrix
-func normalizeMatrix(in [3][3]float64) (out [3][3]float64) {
-	// Get first two rows as vectors
-	t0 := [3]float64{in[0][0], in[0][1], in[0][2]}
-	t1 := [3]float64{in[1][0], in[1][1], in[1][2]}
-	
-	// Normalize first row
-	norm := math.Sqrt(t0[0]*t0[0] + t0[1]*t0[1] + t0[2]*t0[2])
-	if norm > 0 {
-		for i := 0; i < 3; i++ {
-			t0[i] /= norm
-		}
-	}
-	
-	// Make second row orthogonal to first
-	dot := t0[0]*t1[0] + t0[1]*t1[1] + t0[2]*t1[2]
-	for i := 0; i < 3; i++ {
-		t1[i] -= dot * t0[i]
-	}
-	
-	// Normalize second row
-	norm = math.Sqrt(t1[0]*t1[0] + t1[1]*t1[1] + t1[2]*t1[2])
-	if norm > 0 {
-		for i := 0; i < 3; i++ {
-			t1[i] /= norm
-		}
-	}
-	
-	// Third row is cross product of first two
-	t2 := [3]float64{
-		t0[1]*t1[2] - t0[2]*t1[1],
-		t0[2]*t1[0] - t0[0]*t1[2],
-		t0[0]*t1[1] - t0[1]*t1[0],
-	}
-	
-	// Copy back to DCM
-	for i := 0; i < 3; i++ {
-		out[0][i] = t0[i]
-		out[1][i] = t1[i]
-		out[2][i] = t2[i]
-	}
-	return out
+// RateOfTurn returns the turn rate in degrees per second
+func (s *SimpleState) RateOfTurn() (turnRate float64) {
+	return s.turnRate
 }
 
+// GLoad returns the current G load, in G's
+func (s *SimpleState) GLoad() (gLoad float64) {
+	return s.gLoad
+}
 
+// GetState returns the state of the system
+func (s *SimpleState) GetState() *State {
+	return &s.State
+}
+
+// GetLogMap returns a map providing current state and measurement values for analysis
+func (s *SimpleState) GetLogMap() (p map[string]interface{}) {
+	return s.logMap
+}
+
+// GetQuaternion returns the current orientation quaternion
+func (s *SimpleState) GetQuaternion() (q0, q1, q2, q3 float64) {
+	return s.q0, s.q1, s.q2, s.q3
+}
+
+// updateLogMap updates the logging map for analysis
 func updateLogMap(s *SimpleState, m *Measurement, p map[string]interface{}) {
 	var simpleLogMap = map[string]func(s *SimpleState, m *Measurement) float64{
 		"Ta":                func(s *SimpleState, m *Measurement) float64 { return s.T },
 		"TWa":               func(s *SimpleState, m *Measurement) float64 { return s.tW },
-		"Roll":              func(s *SimpleState, m *Measurement) float64 { return s.roll * D2R },
-		"Pitch":             func(s *SimpleState, m *Measurement) float64 { return s.pitch * D2R },
-		"Heading":           func(s *SimpleState, m *Measurement) float64 { return s.heading * D2R },
-		"T":          func(s *SimpleState, m *Measurement) float64 { return m.T },
-		"TW":         func(s *SimpleState, m *Measurement) float64 { return m.TW },
-		"A1":         func(s *SimpleState, m *Measurement) float64 { return m.A1 },
-		"A2":         func(s *SimpleState, m *Measurement) float64 { return m.A2 },
-		"A3":         func(s *SimpleState, m *Measurement) float64 { return m.A3 },
-		"B1":         func(s *SimpleState, m *Measurement) float64 { return m.B1 },
-		"B2":         func(s *SimpleState, m *Measurement) float64 { return m.B2 },
-		"B3":         func(s *SimpleState, m *Measurement) float64 { return m.B3 },
-		"M1":         func(s *SimpleState, m *Measurement) float64 { return m.M1 },
-		"M2":         func(s *SimpleState, m *Measurement) float64 { return m.M2 },
-		"M3":         func(s *SimpleState, m *Measurement) float64 { return m.M3 },
+//		"Roll":              func(s *SimpleState, m *Measurement) float64 { return s.roll * R2D },
+//		"Pitch":             func(s *SimpleState, m *Measurement) float64 { return s.pitch * R2D },
+//		"Heading":           func(s *SimpleState, m *Measurement) float64 { return s.heading * R2D },
+		"Q0":                func(s *SimpleState, m *Measurement) float64 { return s.q0 },
+		"Q1":                func(s *SimpleState, m *Measurement) float64 { return s.q1 },
+		"Q2":                func(s *SimpleState, m *Measurement) float64 { return s.q2 },
+		"Q3":                func(s *SimpleState, m *Measurement) float64 { return s.q3 },
+		"T":                 func(s *SimpleState, m *Measurement) float64 { return m.T },
+		"TW":                func(s *SimpleState, m *Measurement) float64 { return m.TW },
+		"A1":                func(s *SimpleState, m *Measurement) float64 { return m.A1 },
+		"A2":                func(s *SimpleState, m *Measurement) float64 { return m.A2 },
+		"A3":                func(s *SimpleState, m *Measurement) float64 { return m.A3 },
+		"B1":                func(s *SimpleState, m *Measurement) float64 { return m.B1 },
+		"B2":                func(s *SimpleState, m *Measurement) float64 { return m.B2 },
+		"B3":                func(s *SimpleState, m *Measurement) float64 { return m.B3 },
+		"M1":                func(s *SimpleState, m *Measurement) float64 { return m.M1 },
+		"M2":                func(s *SimpleState, m *Measurement) float64 { return m.M2 },
+		"M3":                func(s *SimpleState, m *Measurement) float64 { return m.M3 },
+		"GyroBiasX":         func(s *SimpleState, m *Measurement) float64 { return s.gyroBias[0] },
+		"GyroBiasY":         func(s *SimpleState, m *Measurement) float64 { return s.gyroBias[1] },
+		"GyroBiasZ":         func(s *SimpleState, m *Measurement) float64 { return s.gyroBias[2] },
+		"TurnRate":          func(s *SimpleState, m *Measurement) float64 { return s.turnRate },
+		"GLoad":             func(s *SimpleState, m *Measurement) float64 { return s.gLoad },
+		"SlipSkid":          func(s *SimpleState, m *Measurement) float64 { return s.slipSkid },
 	}
 
 	for k := range simpleLogMap {
@@ -1060,19 +825,19 @@ var SimpleJSONConfig = `{
     ["slipSkid", null, null, "slipSkidActual", 0],
     ["GroundSpeed", null, null, null, 0],
     ["T", null, null, null, null],
-    ["E0", "EGPS0", "EGyr0", "E0Actual", null],
-    ["E1", "EGPS1", "EGyr1", "E1Actual", null],
-    ["E2", "EGPS2", "EGyr2", "E2Actual", null],
-    ["E3", "EGPS3", "EGyr3", "E3Actual", null],
+    ["Q0", "Q0GPS", "Q0Gyr", "Q0Actual", null],
+    ["Q1", "Q1GPS", "Q1Gyr", "Q1Actual", null],
+    ["Q2", "Q2GPS", "Q2Gyr", "Q2Actual", null],
+    ["Q3", "Q3GPS", "Q3Gyr", "Q3Actual", null],
     ["Z1", null, null, "Z1Actual", 0],
     ["Z2", null, null, "Z2Actual", 0],
-    ["Z3", null, null, "Z3Actual", -1]
+    ["Z3", null, null, "Z3Actual", -1],
     ["C1", null, null, "C1Actual", 0],
     ["C2", null, null, "C2Actual", 0],
-    ["C3", null, null, "C3Actual", 0]
+    ["C3", null, null, "C3Actual", 0],
     ["H1", null, null, "H1Actual", 0],
     ["H2", null, null, "H2Actual", 0],
-    ["H3", null, null, "H3Actual", 0]
+    ["H3", null, null, "H3Actual", 0],
     ["D1", null, null, "D1Actual", 0],
     ["D2", null, null, "D2Actual", 0],
     ["D3", null, null, "D3Actual", 0]
@@ -1086,146 +851,12 @@ var SimpleJSONConfig = `{
     ["A3", null, 0],
     ["B1", null, 0],
     ["B2", null, 0],
-    ["B3", null, 0]
+    ["B3", null, 0],
     ["M1", null, 0],
     ["M2", null, 0],
     ["M3", null, 0]
   ]
 }`
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// Valid returns whether the current state is a valid estimate or if something went wrong in the calculation.
-func (s *SimpleState) Valid() (ok bool) {
-	return true
-}
-
-
-// Reset restarts the algorithm from scratch.
-func (s *SimpleState) Reset() {
-	s.needsInitialization = true
-}
-
-// RollPitchHeading returns the current attitude values as estimated by the Kalman algorithm.
-func (s *SimpleState) RollPitchHeading() (roll float64, pitch float64, heading float64) {
-	roll, pitch, heading = s.roll, -s.pitch, s.heading
-	return
-}
-
-
-// MagHeading returns the magnetic heading in degrees.
-func (s *SimpleState) MagHeading() (hdg float64) {
-
-	return s.heading
-}
-
-// SlipSkid returns the slip/skid angle in degrees.
-func (s *SimpleState) SlipSkid() (slipSkid float64) {
-	return s.slipSkid
-}
-
-// RateOfTurn returns the turn rate in degrees per second.
-func (s *SimpleState) RateOfTurn() (turnRate float64) {
-	return 0
-}
-
-// GLoad returns the current G load, in G's.
-func (s *SimpleState) GLoad() (gLoad float64) {
-	return s.gLoad
-}
-
-// GetState returns the state of the system
-func (s *SimpleState) GetState() *State {
-	return &s.State
-}
-
-// GetLogMap returns a map providing current state and measurement values for analysis
-func (s *SimpleState) GetLogMap() (p map[string]interface{}) {
-	return s.logMap
-}
-
 
 // AHRSProvider defines an AHRS (Kalman or other) algorithm, such as ahrs_kalman, ahrs_simple, etc.
 type AHRSProvider interface {
@@ -1246,9 +877,8 @@ type AHRSProvider interface {
 	// GLoad returns the current G load, in G's as estimated by the Kalman algorithm.
 	GLoad() (gLoad float64)
 	// GetState returns all the information about the current state.
-	GetState() 
+	GetState() *State
 	// GetLogMap returns a map customized for each AHRSProvider algorithm to provide more detailed information
 	// for debugging and logging.
 	GetLogMap() map[string]interface{}
 }
-
