@@ -111,7 +111,7 @@ func NewMeasurement() *Measurement {
 
 // init initializes the filter with the first measurement
 func (s *SimpleState) init(m *Measurement) {
-	log.Printf("Initializing Madgwick Filter")
+	//log.Printf("Initializing Madgwick Filter")
 
 	s.T = m.T
 	s.tW = m.TW
@@ -138,7 +138,7 @@ func (s *SimpleState) init(m *Measurement) {
 		// Use MARG (9-DOF) initialization
 		s.initializeMARG(ax, ay, az, mx, my, mz)
 	} else {
-		log.Printf("High magnetometer error")
+		//log.Printf("High magnetometer error")
 		return
 	}
 
@@ -192,20 +192,6 @@ func (s *SimpleState) eulerToQuaternion(roll, pitch, yaw float64) {
 	s.q3 = cr*cp*sy - sr*sp*cy
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // Gyro calibration - collect stationary samples to estimate bias
 func (s *SimpleState) calibrateGyro(m *Measurement) bool {
 	if !m.SValid {
@@ -250,78 +236,6 @@ func (s *SimpleState) ResetGyroCal() {
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /////////////////////////////////////////////////////////////////////////
 // Run
 /////////////////////////////////////////////////////////////////////////
@@ -348,11 +262,6 @@ func (s *SimpleState) Compute(m *Measurement) {
 	// Update log map for debugging
 	updateLogMap(s, m, s.logMap)
 }
-
-
-
-
-
 
 // Madgwick AHRS algorithm implementation
 func (s *SimpleState) Update(m *Measurement) {
@@ -499,137 +408,6 @@ func (s *SimpleState) madgwickAHRS(gx, gy, gz, ax, ay, az, mx, my, mz, dt float6
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // updateEulerAngles converts quaternion to Euler angles
 func (s *SimpleState) updateEulerAngles() (roll float64, pitch float64, heading float64) {
 	// Roll (x-axis rotation)
@@ -665,38 +443,6 @@ func (s *SimpleState) updateEulerAngles() (roll float64, pitch float64, heading 
 	return roll, pitch, heading
 }
 
-
-
-
-
-
-
-
-
-// updateDCM updates the Direction Cosine Matrix from quaternion
-//func (s *SimpleState) updateDCM() {
-	// Convert quaternion to DCM
-//	q0q0 := s.q0 * s.q0
-//	q0q1 := s.q0 * s.q1
-//	q0q2 := s.q0 * s.q2
-//	q0q3 := s.q0 * s.q3
-//	q1q1 := s.q1 * s.q1
-//	q1q2 := s.q1 * s.q2
-//	q1q3 := s.q1 * s.q3
-//	q2q2 := s.q2 * s.q2
-//	q2q3 := s.q2 * s.q3
-//	q3q3 := s.q3 * s.q3
-//
-//	s.dcm[0][0] = q0q0 + q1q1 - q2q2 - q3q3
-//	s.dcm[0][1] = 2*(q1q2 - q0q3)
-//	s.dcm[0][2] = 2*(q1q3 + q0q2)
-//	s.dcm[1][0] = 2*(q1q2 + q0q3)
-//	s.dcm[1][1] = q0q0 - q1q1 + q2q2 - q3q3
-//	s.dcm[1][2] = 2*(q2q3 - q0q1)
-//	s.dcm[2][0] = 2*(q1q3 - q0q2)
-//	s.dcm[2][1] = 2*(q2q3 + q0q1)
-//	s.dcm[2][2] = q0q0 - q1q1 - q2q2 + q3q3
-//}
 
 // updateDerivedQuantities calculates slip/skid, turn rate, g-load
 func (s *SimpleState) updateDerivedQuantities(m *Measurement) {

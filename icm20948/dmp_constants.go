@@ -140,32 +140,29 @@ const (
 	ICMREG_I2C_SLV1_CTRL = 0x09
 	ICMREG_I2C_SLV4_CTRL = 0x15
 
-	/* ---- AK8963 Reg In MPU9250 ----------------------------------------------- */
-	AK8963_I2C_ADDR        = 0x0C //0x18
-	AK8963_Device_ID       = 0x48
-	AK8963_MAX_SAMPLE_RATE = 0x64 // 100 Hz
-	// Read-only Reg
-	AK8963_WIA  = 0x00
-	AK8963_INFO = 0x01
-	AK8963_ST1  = 0x02
-	AK8963_HXL  = 0x03
-	AK8963_HXH  = 0x04
-	AK8963_HYL  = 0x05
-	AK8963_HYH  = 0x06
-	AK8963_HZL  = 0x07
-	AK8963_HZH  = 0x08
-	AK8963_ST2  = 0x09
-	// Write/Read Reg
-	AK8963_CNTL1  = 0x0A
-	AK8963_CNTL2  = 0x0B
-	AK8963_ASTC   = 0x0C
-	AK8963_TS1    = 0x0D
-	AK8963_TS2    = 0x0E
-	AK8963_I2CDIS = 0x0F
-	// Read-only Reg ( ROM )
-	AK8963_ASAX = 0x10
-	AK8963_ASAY = 0x11
-	AK8963_ASAZ = 0x12
+	AK09916_I2C_ADDR byte = 0x0C
+
+	// Register map per ICM-20948 datasheet (AK09916 section)
+	AK09916_WIA2  byte = 0x01 // Device ID
+	AK09916_ST1   byte = 0x10 // Status 1
+	AK09916_HXL   byte = 0x11
+	AK09916_HXH   byte = 0x12
+	AK09916_HYL   byte = 0x13
+	AK09916_HYH   byte = 0x14
+	AK09916_HZL   byte = 0x15
+	AK09916_HZH   byte = 0x16
+	AK09916_ST2   byte = 0x18
+	AK09916_CNTL2 byte = 0x31 // Mode
+
+	// CNTL2 modes (low 5 bits). Typical continuous rate settings:
+	AK09916_MODE_POWER_DOWN  byte = 0x00
+	AK09916_MODE_SINGLE      byte = 0x01
+	AK09916_MODE_CONT_10HZ   byte = 0x02
+	AK09916_MODE_CONT_20HZ   byte = 0x04
+	AK09916_MODE_CONT_50HZ   byte = 0x06
+	AK09916_MODE_CONT_100HZ  byte = 0x08
+
+	
 	// Configuration bits from mpu9250.
 	BIT_SLEEP                  = 0x40
 	BIT_H_RESET                = 0x80

@@ -189,6 +189,9 @@ const (
 	AKM_DATA_OVERRUN             = 0x02
 	AKM_OVERFLOW                 = 0x80
 
+	AKM_16BIT            = 0x10
+	AKM_MODE_CONT_100HZ  = 0x06
+
 	/* = ---- Sensitivity --------------------------------------------------------- */
 
 	MPU9250M_4800uT                       = 0.6            // 0.6 uT/LSB
