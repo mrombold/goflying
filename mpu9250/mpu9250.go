@@ -30,6 +30,7 @@ type Device struct {
 	magEnabled bool
 }
 
+// Output Data Rate (ties accel/gyro via SMPLRT_DIV with DLPF enabled @1kHz base)
 type ODR uint16
 
 const (
@@ -41,6 +42,17 @@ const (
 	ODR25Hz   ODR = 25
 )
 
+func (o ODR) smplrtDiv() (byte, error) {
+	const base = 1000 // Hz with DLPF enabled
+	if o == 0 || int(base)%int(o) != 0 {
+		return 0, errors.New("mpu9250: invalid ODR (not a divisor of 1000)")
+	}
+	div := base/int(o) - 1
+	if div < 0 || div > 255 {
+		return 0, errors.New("mpu9250: ODR out of SMPLRT_DIV range")
+	}
+	return byte(div), nil
+}
 
 // Gyro full-scale range (deg/s)
 type GyroRange byte
@@ -63,21 +75,8 @@ func (g GyroRange) scale() float64 {
 	case Gyro2000DPS:
 		return 2000.0 / 32768.0
 	default:
-		return 0 // invalid; caller should have validated
+		return 0
 	}
-}
-
-
-func (o ODR) smplrtDiv() (byte, error) {
-	base := 1000 // with DLPF enabled
-	if o == 0 || int(base)%int(o) != 0 {
-		return 0, errors.New("mpu9250: invalid ODR (not a divisor of 1000)")
-	}
-	div := base/int(o) - 1
-	if div < 0 || div > 255 {
-		return 0, errors.New("mpu9250: ODR out of SMPLRT_DIV range")
-	}
-	return byte(div), nil
 }
 
 // Accel full-scale range (g)
@@ -106,7 +105,7 @@ func (a AccelRange) scale() float64 {
 }
 
 // Digital low-pass filter settings (datasheet-defined discrete options).
-// These enums map 1:1 to the register’s DLPF_CFG bits.
+// These map 1:1 to the DLPF_CFG bits.
 type DLPF byte
 
 const (
@@ -133,31 +132,55 @@ func New(
 	d := &Device{bus: bus, addr: addr, magEnabled: enableMag}
 
 	// Reset, wake, select PLL clock
-	if err := d.write(MPUREG_PWR_MGMT_1, BIT_H_RESET); err != nil { return nil, err }
+	if err := d.write(MPUREG_PWR_MGMT_1, BIT_H_RESET); err != nil {
+		return nil, err
+	}
 	time.Sleep(100 * time.Millisecond)
-	if err := d.write(MPUREG_PWR_MGMT_1, 0x00); err != nil { return nil, err }
+	if err := d.write(MPUREG_PWR_MGMT_1, 0x00); err != nil {
+		return nil, err
+	}
 	time.Sleep(10 * time.Millisecond)
-	if err := d.write(MPUREG_PWR_MGMT_1, INV_CLK_PLL); err != nil { return nil, err }
+	if err := d.write(MPUREG_PWR_MGMT_1, INV_CLK_PLL); err != nil {
+		return nil, err
+	}
 
 	// Disable FIFO/interrupts: fully polled
-	if err := d.write(MPUREG_FIFO_EN, 0x00); err != nil { return nil, err }
-	if err := d.write(MPUREG_INT_ENABLE, 0x00); err != nil { return nil, err }
+	if err := d.write(MPUREG_FIFO_EN, 0x00); err != nil {
+		return nil, err
+	}
+	if err := d.write(MPUREG_INT_ENABLE, 0x00); err != nil {
+		return nil, err
+	}
 
 	// Ranges (sets scales)
-	if err := d.SetGyroRange(gfs); err != nil { return nil, err }
-	if err := d.SetAccelRange(afs); err != nil { return nil, err }
+	if err := d.SetGyroRange(gfs); err != nil {
+		return nil, err
+	}
+	if err := d.SetAccelRange(afs); err != nil {
+		return nil, err
+	}
 
-	// DLPFs first (ensures base rate is 1 kHz for SMPLRT_DIV math)
-	if err := d.SetGyroLPF(gyroLPF); err != nil { return nil, err }
-	if err := d.SetAccelLPF(accelLPF); err != nil { return nil, err }
+	// DLPFs first (base rate 1kHz for SMPLRT_DIV math)
+	if err := d.SetGyroLPF(gyroLPF); err != nil {
+		return nil, err
+	}
+	if err := d.SetAccelLPF(accelLPF); err != nil {
+		return nil, err
+	}
 
-	// ODR via SMPLRT_DIV (ties gyro/accel together in this driver)
+	// ODR via SMPLRT_DIV
 	div, err := odr.smplrtDiv()
-	if err != nil { return nil, err }
-	if err := d.write(MPUREG_SMPLRT_DIV, div); err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
+	if err := d.write(MPUREG_SMPLRT_DIV, div); err != nil {
+		return nil, err
+	}
 
 	// Enable sensors
-	if err := d.write(MPUREG_PWR_MGMT_2, 0x00); err != nil { return nil, err }
+	if err := d.write(MPUREG_PWR_MGMT_2, 0x00); err != nil {
+		return nil, err
+	}
 
 	// Magnetometer: bypass + factory adj + 16-bit continuous 100 Hz
 	if d.magEnabled {
@@ -170,16 +193,13 @@ func New(
 	return d, nil
 }
 
-
 func (d *Device) Close() error {
-	// Put to sleep (optional)
-	_ = d.write(MPUREG_PWR_MGMT_1, 0x40) // sleep bit
+	_ = d.write(MPUREG_PWR_MGMT_1, BIT_SLEEP) // optional sleep
 	return nil
 }
 
-/* ------------ Public helpers (optional) ------------ */
+/* ------------ Public helpers ------------ */
 
-// SetGyroLPF sets the gyro DLPF (type-safe).
 func (d *Device) SetGyroLPF(lpf DLPF) error {
 	switch lpf {
 	case DLPF_5HZ, DLPF_10HZ, DLPF_20HZ, DLPF_42HZ, DLPF_98HZ, DLPF_188HZ:
@@ -189,7 +209,6 @@ func (d *Device) SetGyroLPF(lpf DLPF) error {
 	}
 }
 
-// SetAccelLPF sets the accel DLPF (type-safe).
 func (d *Device) SetAccelLPF(lpf DLPF) error {
 	switch lpf {
 	case DLPF_5HZ, DLPF_10HZ, DLPF_20HZ, DLPF_42HZ, DLPF_98HZ, DLPF_188HZ:
@@ -199,11 +218,9 @@ func (d *Device) SetAccelLPF(lpf DLPF) error {
 	}
 }
 
-// SetGyroRange sets the gyro full-scale range using the enum.
 func (d *Device) SetGyroRange(r GyroRange) error {
 	switch r {
 	case Gyro250DPS, Gyro500DPS, Gyro1000DPS, Gyro2000DPS:
-		// write the bits and set the scale
 		if err := d.write(MPUREG_GYRO_CONFIG, byte(r)); err != nil {
 			return err
 		}
@@ -214,7 +231,6 @@ func (d *Device) SetGyroRange(r GyroRange) error {
 	}
 }
 
-// SetAccelRange sets the accelerometer full-scale range using the enum.
 func (d *Device) SetAccelRange(r AccelRange) error {
 	switch r {
 	case Accel2G, Accel4G, Accel8G, Accel16G:
@@ -228,21 +244,19 @@ func (d *Device) SetAccelRange(r AccelRange) error {
 	}
 }
 
-
 /* ------------ Core read path (deterministic, blocking) ------------ */
 
-// Read fetches one instantaneous sample (gyro, accel, and mag if enabled).
 func (d *Device) Read() (Sample, error) {
 	var s Sample
 
-	// Read accel/gyro/temperature registers (6+6 words). We pull gyro first to minimize latency skew.
+	// Read gyro then accel (reduce skew)
 	gx, errG := d.readWord(MPUREG_GYRO_XOUT_H)
-	gy, _   := d.readWord(MPUREG_GYRO_YOUT_H)
-	gz, _   := d.readWord(MPUREG_GYRO_ZOUT_H)
+	gy, _ := d.readWord(MPUREG_GYRO_YOUT_H)
+	gz, _ := d.readWord(MPUREG_GYRO_ZOUT_H)
 
 	ax, errA := d.readWord(MPUREG_ACCEL_XOUT_H)
-	ay, _    := d.readWord(MPUREG_ACCEL_YOUT_H)
-	az, _    := d.readWord(MPUREG_ACCEL_ZOUT_H)
+	ay, _ := d.readWord(MPUREG_ACCEL_YOUT_H)
+	az, _ := d.readWord(MPUREG_ACCEL_ZOUT_H)
 
 	if errG != nil || errA != nil {
 		s.IMUError = firstErr(errG, errA)
@@ -273,63 +287,98 @@ func (d *Device) Read() (Sample, error) {
 }
 
 /* ------------ Internals ------------ */
+
+// AK8963 lives at 0x0C on the auxiliary I2C bus (bypass mode)
+const ak8963Addr = AK8963_I2C_ADDR // 0x0C
+
+func (d *Device) writeMag(reg, val byte) error {
+	return d.bus.WriteByteToReg(ak8963Addr, reg, val)
+}
+
+func (d *Device) readMagByte(reg byte) (byte, error) {
+	return d.bus.ReadByteFromReg(ak8963Addr, reg)
+}
+
+func (d *Device) readMagBlock(reg byte, dst []byte) error {
+	return d.bus.ReadFromReg(ak8963Addr, reg, dst)
+}
+
 func (d *Device) setupMagBypassAndCal() error {
-	// Local AK8963 constants (safe if your global constants differ/move)
-	const (
-		ak8963_CNTL1         = AK8963_CNTL1
-		ak8963_ST1           = AK8963_ST1
-		ak8963_HXL           = AK8963_HXL
-		ak8963_ASAX          = AK8963_ASAX
-		ak8963_ASAY          = AK8963_ASAY
-		ak8963_ASAZ          = AK8963_ASAZ
-		akm_16bit      byte  = 0x10
-		akm_cont_100hz byte  = 0x06
-		lsbToUT        float64 = 0.15 // 16-bit mode scale
-	)
-
-	// Enable bypass: disable AUX master, set BYPASS_EN
-	uc, err := d.readByte(MPUREG_USER_CTRL); if err != nil { return err }
-	if err := d.write(MPUREG_USER_CTRL, uc &^ BIT_AUX_IF_EN); err != nil { return err }
+	// Enable BYPASS_EN on MPU, disable AUX master
+	uc, err := d.readByte(MPUREG_USER_CTRL)
+	if err != nil {
+		return err
+	}
+	if err := d.write(MPUREG_USER_CTRL, uc&^BIT_AUX_IF_EN); err != nil {
+		return err
+	}
 	time.Sleep(3 * time.Millisecond)
-	if err := d.write(MPUREG_INT_PIN_CFG, BIT_BYPASS_EN); err != nil { return err }
+	if err := d.write(MPUREG_INT_PIN_CFG, BIT_BYPASS_EN); err != nil {
+		return err
+	}
 	time.Sleep(3 * time.Millisecond)
 
-	// Power down, go to fuse ROM to read ASA
-	if err := d.write(ak8963_CNTL1, AKM_POWER_DOWN); err != nil { return err }
+	// AK8963: power down -> fuse ROM access -> read ASA -> power down -> 16-bit continuous 100 Hz
+	if err := d.writeMag(AK8963_CNTL1, AKM_POWER_DOWN); err != nil {
+		return err
+	}
 	time.Sleep(1 * time.Millisecond)
-	if err := d.write(ak8963_CNTL1, AK8963_I2CDIS); err != nil { return err } // 0x0F: Fuse ROM access
+	if err := d.writeMag(AK8963_CNTL1, AK8963_I2CDIS); err != nil { // 0x0F: Fuse ROM
+		return err
+	}
 	time.Sleep(1 * time.Millisecond)
 
-	ax, err := d.readByte(ak8963_ASAX); if err != nil { return err }
-	ay, err := d.readByte(ak8963_ASAY); if err != nil { return err }
-	az, err := d.readByte(ak8963_ASAZ); if err != nil { return err }
+	ax, err := d.readMagByte(AK8963_ASAX)
+	if err != nil {
+		return err
+	}
+	ay, err := d.readMagByte(AK8963_ASAY)
+	if err != nil {
+		return err
+	}
+	az, err := d.readMagByte(AK8963_ASAZ)
+	if err != nil {
+		return err
+	}
 
+	// Sensitivity adjustment: (ASA-128)/256 + 1.0; 0.15 uT/LSB at 16-bit
+	const lsbToUT = 0.15
 	d.magAdj[0] = (float64(int(ax)-128)/256.0 + 1.0) * lsbToUT
 	d.magAdj[1] = (float64(int(ay)-128)/256.0 + 1.0) * lsbToUT
 	d.magAdj[2] = (float64(int(az)-128)/256.0 + 1.0) * lsbToUT
 
-	// Exit fuse ROM; set 16-bit, continuous 100 Hz
-	if err := d.write(ak8963_CNTL1, AKM_POWER_DOWN); err != nil { return err }
+	if err := d.writeMag(AK8963_CNTL1, AKM_POWER_DOWN); err != nil {
+		return err
+	}
 	time.Sleep(1 * time.Millisecond)
-	if err := d.write(ak8963_CNTL1, akm_16bit|akm_cont_100hz); err != nil { return err }
+	if err := d.writeMag(AK8963_CNTL1, AKM_16BIT|AKM_MODE_CONT_100HZ); err != nil {
+		return err
+	}
 	time.Sleep(10 * time.Millisecond)
 	return nil
 }
 
-
 // readMagOnce reads AK8963 in bypass mode; returns raw int16 (little-endian).
 func (d *Device) readMagOnce() (mx, my, mz int16, err error) {
 	// Check DRDY
-	st1, e := d.readByte(AK8963_ST1)
-	if e != nil { return 0,0,0,e }
-	if st1 & AKM_DATA_READY == 0 { return 0,0,0,errors.New("mag not ready") }
+	st1, e := d.readMagByte(AK8963_ST1)
+	if e != nil {
+		return 0, 0, 0, e
+	}
+	if st1&AKM_DATA_READY == 0 {
+		return 0, 0, 0, errors.New("mag not ready")
+	}
 
-	// Read 7 bytes: HXL..HZH, ST2
+	// Read 6 data + ST2
 	buf := make([]byte, 7)
-	if e = d.readBlock(AK8963_HXL, buf); e != nil { return 0,0,0,e }
+	if e = d.readMagBlock(AK8963_HXL, buf); e != nil {
+		return 0, 0, 0, e
+	}
 
-	// Overflow check
-	if buf[6] & AKM_OVERFLOW != 0 { return 0,0,0,errors.New("mag overflow") }
+	// Overflow (ST2.HOFL bit)
+	if buf[6]&AKM_OVERFLOW != 0 {
+		return 0, 0, 0, errors.New("mag overflow")
+	}
 
 	// Little endian
 	mx = int16(uint16(buf[1])<<8 | uint16(buf[0]))
@@ -357,6 +406,8 @@ func (d *Device) readBlock(reg byte, dst []byte) error {
 }
 
 func firstErr(a, b error) error {
-	if a != nil { return a }
+	if a != nil {
+		return a
+	}
 	return b
 }

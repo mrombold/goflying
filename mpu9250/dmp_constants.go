@@ -117,10 +117,12 @@ const (
 	MPUREG_YA_OFFSET_L        = 0x7B
 	MPUREG_ZA_OFFSET_H        = 0x7D
 	MPUREG_ZA_OFFSET_L        = 0x7E
+
 	/* ---- AK8963 Reg In MPU9250 ----------------------------------------------- */
-	AK8963_I2C_ADDR        = 0x0C //0x18
+	AK8963_I2C_ADDR        = 0x0C
 	AK8963_Device_ID       = 0x48
 	AK8963_MAX_SAMPLE_RATE = 0x64 // 100 Hz
+
 	// Read-only Reg
 	AK8963_WIA  = 0x00
 	AK8963_INFO = 0x01
@@ -132,6 +134,7 @@ const (
 	AK8963_HZL  = 0x07
 	AK8963_HZH  = 0x08
 	AK8963_ST2  = 0x09
+
 	// Write/Read Reg
 	AK8963_CNTL1  = 0x0A
 	AK8963_CNTL2  = 0x0B
@@ -139,25 +142,30 @@ const (
 	AK8963_TS1    = 0x0D
 	AK8963_TS2    = 0x0E
 	AK8963_I2CDIS = 0x0F
+
 	// Read-only Reg ( ROM )
 	AK8963_ASAX = 0x10
 	AK8963_ASAY = 0x11
 	AK8963_ASAZ = 0x12
-	// Configuration bits mpu9250
+
+	// Configuration bits
 	BIT_SLEEP                  = 0x40
 	BIT_H_RESET                = 0x80
 	BITS_CLKSEL                = 0x07
 	MPU_CLK_SEL_PLLGYROX       = 0x01
 	MPU_CLK_SEL_PLLGYROZ       = 0x03
 	MPU_EXT_SYNC_GYROX         = 0x02
-	BITS_FS_250DPS             = 0x00
-	BITS_FS_500DPS             = 0x08
-	BITS_FS_1000DPS            = 0x10
-	BITS_FS_2000DPS            = 0x18
-	BITS_FS_2G                 = 0x00
-	BITS_FS_4G                 = 0x08
-	BITS_FS_8G                 = 0x10
-	BITS_FS_16G                = 0x18
+
+	BITS_FS_250DPS  = 0x00
+	BITS_FS_500DPS  = 0x08
+	BITS_FS_1000DPS = 0x10
+	BITS_FS_2000DPS = 0x18
+
+	BITS_FS_2G  = 0x00
+	BITS_FS_4G  = 0x08
+	BITS_FS_8G  = 0x10
+	BITS_FS_16G = 0x18
+
 	BITS_FS_MASK               = 0x18
 	BITS_DLPF_CFG_256HZ_NOLPF2 = 0x00
 	BITS_DLPF_CFG_188HZ        = 0x01
@@ -168,33 +176,34 @@ const (
 	BITS_DLPF_CFG_5HZ          = 0x06
 	BITS_DLPF_CFG_2100HZ_NOLPF = 0x07
 	BITS_DLPF_CFG_MASK         = 0x07
-	BIT_INT_ANYRD_2CLEAR       = 0x10
-	BIT_RAW_RDY_EN             = 0x01
-	BIT_I2C_IF_DIS             = 0x10
+
+	BIT_INT_ANYRD_2CLEAR = 0x10
+	BIT_RAW_RDY_EN       = 0x01
+	BIT_I2C_IF_DIS       = 0x10
 
 	// Misc
-	READ_FLAG                    = 0x80
-	MPU_BANK_SIZE                = 0xFF
-	CFG_MOTION_BIAS              = 0x4B8 // Enable/disable gyro bias compensation
-	BIT_FIFO_SIZE_1024           = 0x40  // FIFO buffer size
-	BIT_AUX_IF_EN          uint8 = 0x20
-	BIT_BYPASS_EN                = 0x02
-	AKM_POWER_DOWN               = 0x00
-	BIT_I2C_READ                 = 0x80
-	BIT_SLAVE_EN                 = 0x80
-	AKM_SINGLE_MEASUREMENT       = 0x01
-	INV_CLK_PLL                  = 0x01
-	AK89xx_FSR                   = 9830
-	AKM_DATA_READY               = 0x01
-	AKM_DATA_OVERRUN             = 0x02
-	AKM_OVERFLOW                 = 0x80
+	READ_FLAG          = 0x80
+	MPU_BANK_SIZE      = 0xFF
+	CFG_MOTION_BIAS    = 0x4B8 // Enable/disable gyro bias compensation
+	BIT_FIFO_SIZE_1024 = 0x40  // FIFO buffer size
+	BIT_AUX_IF_EN byte = 0x20
+	BIT_BYPASS_EN      = 0x02
 
-	AKM_16BIT            = 0x10
-	AKM_MODE_CONT_100HZ  = 0x06
+	AKM_POWER_DOWN         = 0x00
+	BIT_I2C_READ           = 0x80
+	BIT_SLAVE_EN           = 0x80
+	AKM_SINGLE_MEASUREMENT = 0x01
+	INV_CLK_PLL            = 0x01
+	AK89xx_FSR             = 9830
+	AKM_DATA_READY         = 0x01
+	AKM_DATA_OVERRUN       = 0x02
+	AKM_OVERFLOW           = 0x08 // **Correct HOFL bit in ST2 for AK8963**
 
-	/* = ---- Sensitivity --------------------------------------------------------- */
+	AKM_16BIT           = 0x10
+	AKM_MODE_CONT_100HZ = 0x06
 
-	MPU9250M_4800uT                       = 0.6            // 0.6 uT/LSB
-	MPU9250T_85degC                       = 0.002995177763 // 0.002995177763 degC/LSB
-	Magnetometer_Sensitivity_Scale_Factor = 0.15
+	/* Sensitivity */
+	MPU9250M_4800uT                       = 0.6            // 0.6 uT/LSB (legacy)
+	MPU9250T_85degC                       = 0.002995177763 // degC/LSB
+	Magnetometer_Sensitivity_Scale_Factor = 0.15           // uT/LSB @ 16-bit
 )
